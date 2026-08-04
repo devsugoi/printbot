@@ -394,12 +394,11 @@ class PrintBot(commands.Bot):
                 is_explicit_retry = current.status != STATUS_AWAITING_CONFIRMATION
 
                 if decision.decision == "approve":
-                    fit_short = decision.fit_on_short if decision.fit_on_short else None
                     await self.confirmation.handle_approval(
                         job.message_id, source="email",
                         actor=reply.from_address, copies=decision.copies,
                         is_explicit_retry=is_explicit_retry,
-                        fit_long_on_short=fit_short,
+                        fit_long_on_short=decision.fit_on_short,
                     )
                 elif decision.decision == "cancel":
                     await self.confirmation.handle_cancel(
@@ -507,11 +506,10 @@ class CopiesModal(discord.ui.Modal):
         await interaction.response.send_message(
             "Got it — working on it now.", ephemeral=True
         )
-        fit_short = True if self.fit_long_on_short else None
         await self.confirmation.handle_approval(
             self.message_id, source="discord", actor=str(interaction.user),
             copies=copies, is_explicit_retry=self.is_explicit_retry,
-            fit_long_on_short=fit_short,
+            fit_long_on_short=self.fit_long_on_short,
         )
 
 
