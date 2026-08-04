@@ -19,10 +19,12 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
+import errno
 import http.client
 import logging
 import os
 import socket
+import threading
 
 import httplib2
 from google.auth.transport.requests import Request
@@ -52,6 +54,12 @@ HTTP_TIMEOUT_SECONDS = 60
 RECONNECT_ATTEMPTS = 2
 
 logger = logging.getLogger(__name__)
+
+# httplib2 is not thread-safe. Discord runs poll_gmail and poll_email_replies
+# concurrently via asyncio.to_thread on one shared service -- serialize all
+# HTTP use (including reconnect) so one thread cannot close sockets another
+# is still writing to (EBADF / heap corruption / ABRT).
+_gmail_http_lock = threading.Lock()
 
 # Errors that mean httplib2's connection pool is unusable until rebuilt.
 _POISONED_CONNECTION_ERRORS = (
@@ -186,9 +194,29 @@ def _is_poisoned_connection_error(error: BaseException) -> bool:
         return True
     if isinstance(error, HttpError) and _is_html_bad_request(error):
         return True
-    # httplib2 sometimes wraps timeouts as SSLError with this message.
+    # One thread closed/replaced the socket while another was writing.
+    if isinstance(error, OSError) and getattr(error, "errno", None) == errno.EBADF:
+        return True
     message = str(error).lower()
-    return "timed out" in message or "the read operation timed out" in message
+    return (
+        "timed out" in message
+        or "the read operation timed out" in message
+        or "record_layer_failure" in message
+        or "bad file descriptor" in message
+    )
+
+
+def is_transient_gmail_error(error: BaseException) -> bool:
+    """True for network/connection blips that should retry next poll without
+    a full traceback in journalctl."""
+    if _is_poisoned_connection_error(error):
+        return True
+    if isinstance(error, HttpError):
+        status = getattr(getattr(error, "resp", None), "status", None)
+        # 429/5xx are transient; HTML 400 already covered as poisoned.
+        if status in (429, 500, 502, 503, 504):
+            return True
+    return False
 
 
 def _execute(service, request):
@@ -197,26 +225,30 @@ def _execute(service, request):
     googleapiclient's own num_retries handles clean transient errors. After a
     timeout, the pooled connection is often half-closed and the next attempt
     raises CannotSendHeader (or a mangled HTML 400). Those need a fresh Http.
+
+    All Gmail HTTP (including reconnect) is serialized on _gmail_http_lock
+    because httplib2 is not safe across the bot's concurrent poll threads.
     """
     last_error: BaseException | None = None
 
-    for attempt in range(RECONNECT_ATTEMPTS + 1):
-        try:
-            # Keep the request's http in sync with the service after reconnects.
-            request.http = service._http
-            return request.execute(num_retries=NUM_RETRIES)
-        except Exception as e:
-            last_error = e
-            if attempt >= RECONNECT_ATTEMPTS or not _is_poisoned_connection_error(e):
-                raise
-            logger.warning(
-                "Gmail request failed with poisoned connection (%s); "
-                "reconnecting (attempt %d/%d)",
-                type(e).__name__,
-                attempt + 1,
-                RECONNECT_ATTEMPTS,
-            )
-            _reconnect_http(service)
+    with _gmail_http_lock:
+        for attempt in range(RECONNECT_ATTEMPTS + 1):
+            try:
+                # Keep the request's http in sync with the service after reconnects.
+                request.http = service._http
+                return request.execute(num_retries=NUM_RETRIES)
+            except Exception as e:
+                last_error = e
+                if attempt >= RECONNECT_ATTEMPTS or not _is_poisoned_connection_error(e):
+                    raise
+                logger.warning(
+                    "Gmail request failed with poisoned connection (%s); "
+                    "reconnecting (attempt %d/%d)",
+                    type(e).__name__,
+                    attempt + 1,
+                    RECONNECT_ATTEMPTS,
+                )
+                _reconnect_http(service)
 
     assert last_error is not None
     raise last_error

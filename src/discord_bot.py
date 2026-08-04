@@ -168,8 +168,14 @@ class PrintBot(commands.Bot):
     async def poll_gmail(self):
         try:
             await self._poll_gmail_once()
-        except Exception:
-            logger.exception("Error while polling Gmail for new emails")
+        except Exception as e:
+            if gmail_client.is_transient_gmail_error(e):
+                logger.warning(
+                    "Transient error while polling Gmail for new emails: %s: %s",
+                    type(e).__name__, e,
+                )
+            else:
+                logger.exception("Error while polling Gmail for new emails")
 
     async def _poll_gmail_once(self):
         message_ids = await asyncio.to_thread(
@@ -183,15 +189,22 @@ class PrintBot(commands.Bot):
                 continue
             try:
                 await self._handle_candidate_message(message_id)
-            except Exception:
+            except Exception as e:
                 # Leave it unmarked so a transient failure (network, etc.)
                 # gets retried next poll instead of being silently
                 # skipped forever -- and don't let it stop the rest of
                 # this batch from being checked.
-                logger.exception(
-                    "Failed to handle candidate message %s -- will retry next poll",
-                    message_id,
-                )
+                if gmail_client.is_transient_gmail_error(e):
+                    logger.warning(
+                        "Transient failure handling candidate %s -- will retry "
+                        "next poll: %s: %s",
+                        message_id, type(e).__name__, e,
+                    )
+                else:
+                    logger.exception(
+                        "Failed to handle candidate message %s -- will retry next poll",
+                        message_id,
+                    )
                 continue
             # Only mark processed once handling actually completed (found
             # a print request and asked about it, or decided it wasn't one).
@@ -334,8 +347,14 @@ class PrintBot(commands.Bot):
     async def poll_email_replies(self):
         try:
             await self._poll_email_replies_once()
-        except Exception:
-            logger.exception("Error while polling email replies")
+        except Exception as e:
+            if gmail_client.is_transient_gmail_error(e):
+                logger.warning(
+                    "Transient error while polling email replies: %s: %s",
+                    type(e).__name__, e,
+                )
+            else:
+                logger.exception("Error while polling email replies")
 
     async def _poll_email_replies_once(self):
         jobs = self.state.jobs_awaiting_email_replies(
@@ -348,15 +367,22 @@ class PrintBot(commands.Bot):
                     gmail_client.list_new_thread_replies,
                     self.gmail_service, job.thread_id, job.last_seen_internal_date_ms,
                 )
-            except Exception:
+            except Exception as e:
                 # A transient error (e.g. a network hiccup) fetching one
                 # job's thread shouldn't stop every other job from being
                 # checked this cycle -- log it and move on; it'll be
                 # retried next poll.
-                logger.exception(
-                    "Failed to fetch replies for job %s -- will retry next poll",
-                    job.message_id,
-                )
+                if gmail_client.is_transient_gmail_error(e):
+                    logger.warning(
+                        "Transient failure fetching replies for job %s -- will "
+                        "retry next poll: %s: %s",
+                        job.message_id, type(e).__name__, e,
+                    )
+                else:
+                    logger.exception(
+                        "Failed to fetch replies for job %s -- will retry next poll",
+                        job.message_id,
+                    )
                 continue
 
             for reply in replies:
