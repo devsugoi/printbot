@@ -162,19 +162,59 @@ class ConfirmationManager:
         job.status = STATUS_PRINTING
         self.state.save_job(job)
 
-        available = await asyncio.to_thread(
-            printer.is_printer_available, self.app_config.printer.name
+        logger.info(
+            "Starting print for job %s subject=%r copies=%d fit_long_on_short=%s "
+            "files=%d group_index=%d",
+            job.message_id, job.subject, job.copies, job.fit_long_on_short,
+            len(job.files), job.current_group_index,
         )
-        if not available:
+
+        availability = await asyncio.to_thread(
+            printer.check_printer_availability, self.app_config.printer.name
+        )
+        if not availability.available:
+            logger.warning(
+                "Printer unavailable for job %s: %s",
+                job.message_id, availability.detail,
+            )
             await self._fail_job(
-                job, "Printer not detected. Is it powered on and connected?"
+                job,
+                f"Printer not ready: {availability.detail}. "
+                f"Is it powered on, connected, and enabled in CUPS?",
             )
             return
 
+        logger.info(
+            "Printer available for job %s: %s",
+            job.message_id, availability.detail,
+        )
+
         groups = job.paper_size_groups()
+        if not job.files or not groups:
+            logger.error(
+                "Job %s has nothing to print (files=%d groups=%d)",
+                job.message_id, len(job.files), len(groups),
+            )
+            await self._fail_job(job, "Nothing to print — no files were prepared for this job.")
+            return
+        if job.current_group_index >= len(groups):
+            logger.error(
+                "Job %s has no remaining paper-size groups "
+                "(group_index=%d groups=%d)",
+                job.message_id, job.current_group_index, len(groups),
+            )
+            await self._fail_job(
+                job,
+                "Nothing left to print — all paper-size groups were already completed.",
+            )
+            return
 
         for group_index in range(job.current_group_index, len(groups)):
             paper_size, files = groups[group_index]
+            logger.info(
+                "Job %s printing group %d/%d paper_size=%s (%d file(s))",
+                job.message_id, group_index + 1, len(groups), paper_size, len(files),
+            )
 
             job.attempts += 1
             job.last_attempt_at = time.time()
@@ -186,16 +226,33 @@ class ConfirmationManager:
                         job, f
                     )
                 except pdf_utils.OfficeConversionError as e:
+                    logger.error(
+                        "Office conversion failed for job %s file %s: %s",
+                        job.message_id, f.path, e,
+                    )
                     await self._fail_job(job, str(e), group_index)
                     return
+
+                logger.info(
+                    "Job %s submitting file %s (requested=%s effective=%s)",
+                    job.message_id, print_path, f.paper_size, effective_size,
+                )
                 result = await asyncio.to_thread(
                     printer.print_file,
                     print_path, effective_size,
                     self.app_config.printer.name, job.copies,
                 )
                 if not result.success:
+                    logger.error(
+                        "Job %s print failed for %s: %s",
+                        job.message_id, print_path, result.message,
+                    )
                     await self._fail_job(job, result.message, group_index)
                     return
+                logger.info(
+                    "Job %s CUPS accepted %s: %s",
+                    job.message_id, print_path, result.message,
+                )
 
             job.current_group_index = group_index + 1
             self.state.save_job(job)
@@ -209,6 +266,10 @@ class ConfirmationManager:
                 next_paper_size, _ = groups[job.current_group_index]
                 job.status = STATUS_AWAITING_CONFIRMATION
                 self.state.save_job(job)
+                logger.info(
+                    "Job %s pausing for tray swap: next paper_size=%s",
+                    job.message_id, next_paper_size,
+                )
                 short_option = (
                     ' Or click **Print on short bond** / reply "use short '
                     'bond" to scale the rest onto the paper already loaded.'
@@ -234,6 +295,12 @@ class ConfirmationManager:
         job.status = STATUS_PRINTED
         self.state.save_job(job)
         plural = "y" if job.copies == 1 else "ies"
+        logger.info(
+            "Job %s marked printed (CUPS accepted all files; copies=%d). "
+            "Physical output is not verified — check the printer / "
+            "`lpstat -o` if no paper came out.",
+            job.message_id, job.copies,
+        )
         await self.notify_both(
             job,
             discord_text=(
