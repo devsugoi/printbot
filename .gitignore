@@ -1,0 +1,8 @@
+config.yaml
+credentials/*.json
+state.json
+jobs/
+printbot.env
+venv/
+__pycache__/
+*.pyc

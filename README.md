@@ -1,0 +1,355 @@
+# Gmail Print Bot
+
+A bot that watches your Gmail inbox, uses Gemini (free tier) to detect
+emails asking you to print an attachment, and prints them to a **Brother
+DCP-J100** — but only after you confirm, either on **Discord or by
+replying to the email itself**. Designed to run unattended on a
+**Raspberry Pi Zero 2 W**.
+
+## How it works
+
+```
+Gmail (poll every N seconds)
+   │
+   ▼
+Gemini classifies: "is this a print request?" + paper size guess
+   │  (tries multiple API keys / models, falling back on quota errors)
+   ▼
+Download attachment(s)
+   │  images only → combined into one short-bond-paper PDF, one image per page
+   ▼
+Ask on BOTH channels: Discord embed [Print] [Cancel]  +  reply in the email thread
+   │  (a generated preview PDF, if any, is attached so you can check it)
+   ▼
+Whichever channel responds first wins — locked so the other is a no-op
+   │
+   ▼
+Notify BOTH channels: "approved via X — printing N copies"
+   │
+   ▼
+Check printer is online → lp -d <printer> ... -n <copies> file
+   │
+   ├─ success → notify BOTH: printed ✅  ("print again" available anytime)
+   └─ failure → notify BOTH: failed ❌ with the error, offer reprint
+```
+
+If a single email mixes images (always short bond paper) with a real
+document that needs long bond paper, the job is split into paper-size
+groups and printed one group at a time, pausing to ask you to swap the
+tray between groups.
+
+Every job is saved to `state.json` (files, paper sizes, status, copies,
+email thread info), so:
+- The same email is never asked about twice.
+- A job can be reprinted or "printed again" at any time, even after a
+  restart — via the Discord button, `!reprint <message_id>`, or just
+  replying to the email thread.
+
+## Project layout
+
+```
+printbot/
+├── main.py                 # entry point
+├── config.example.yaml     # copy to config.yaml and fill in
+├── requirements.txt
+├── src/
+│   ├── config.py            # loads config.yaml (+ "ENV:VAR" secrets)
+│   ├── state.py              # JSON persistence: jobs, files, paper-size groups
+│   ├── gmail_client.py       # Gmail API: search, download, reply-in-thread, read replies
+│   ├── ai_classifier.py      # Gemini: is-it-a-print-request + reply-intent parsing
+│   ├── pdf_utils.py          # image→PDF, paper size detection for real documents
+│   ├── printer.py            # CUPS `lp` wrapper (paper size, copies)
+│   ├── confirmation.py       # shared approve/cancel/print logic + the "first wins" lock
+│   └── discord_bot.py        # Gmail + email-reply polling, Discord UI
+├── credentials/              # your OAuth + token files (gitignored)
+└── jobs/                     # downloaded attachments + generated PDFs
+```
+
+## 1. Set up the Raspberry Pi
+
+```bash
+sudo apt update
+sudo apt install -y cups cups-bsd printer-driver-brlaser python3-pip python3-venv git
+sudo usermod -aG lpadmin $USER   # then log out/in
+```
+
+Install the Brother DCP-J100 driver and add the printer. Brother publishes
+Linux drivers for this model; alternatively `printer-driver-brlaser` (a
+generic open-source driver) often works fine for basic printing. Add the
+printer via the CUPS web UI (`http://<pi-ip>:631`) or:
+
+```bash
+lpadmin -p Brother_DCP_J100 -E -v <device-uri> -m everywhere
+lpoptions -d Brother_DCP_J100
+lpstat -p Brother_DCP_J100         # confirm it shows up
+lpoptions -p Brother_DCP_J100 -l   # see exactly what paper sizes/media names it supports
+```
+
+**Note:** the printer is only ever fed one of two paper choices: **short
+bond paper** (8.5" x 11", i.e. Letter) or **long bond paper** (8.5" x 14",
+i.e. Legal). These map to the CUPS "media" values `Letter` / `Legal` in
+`src/printer.py` (`CUPS_MEDIA_NAMES`). Check `lpoptions -p <printer> -l`
+and adjust that dict if your driver uses different names (e.g.
+`na_letter_8.5x11in` / `na_legal_8.5x14in`).
+
+## 2. Clone the project & install Python dependencies
+
+```bash
+git clone <your-repo-url> printbot
+cd printbot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 3. Gmail API setup
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/),
+   create a project, and enable the **Gmail API**.
+2. Create an **OAuth 2.0 Client ID** of type **Desktop app**. Download the
+   JSON file and save it as `credentials/credentials.json`.
+3. First-time authentication opens a browser, which a headless Pi doesn't
+   have. Easiest option: run the bot **once on your laptop** (same
+   `credentials/credentials.json`) so the browser flow completes and a
+   `token.json` is generated, then copy `credentials/token.json` to the Pi.
+   Alternatively, SSH into the Pi with port forwarding
+   (`ssh -L 8080:localhost:8080 pi@<ip>`) and run it there directly.
+4. The token auto-refreshes after that — no browser needed again.
+
+**The bot requests two scopes: `gmail.readonly` and `gmail.send`** — the
+second one is new, needed so the bot can reply in-thread to ask for
+confirmation and post results. **If you set this bot up before email
+confirmation existed, delete `credentials/token.json` and redo step 3** so
+a token with the new scope gets issued; the old readonly-only token will
+fail when the bot tries to send.
+
+## 4. Gemini API keys (free tier)
+
+1. Get one or more free API keys from
+   [Google AI Studio](https://aistudio.google.com/apikey). Using keys from
+   a few different Google accounts/projects gives you more combined free
+   quota, which is why the bot supports multiple keys.
+2. List them under `gemini.api_keys` in `config.yaml` (or reference
+   environment variables with `ENV:VAR_NAME`, see below).
+3. List the models to try, in order, under `gemini.models`. Check
+   [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models)
+   for the current free-tier model names and rate limits, since these
+   change over time — the bot will automatically skip any model that
+   returns "not found" or "overloaded" and try the next one.
+
+**Fallback behavior:** for each Gemini call (classifying a new email, or
+interpreting a confirmation reply), the bot tries every model in
+`gemini.models` for the current key. If a model is missing/overloaded
+(HTTP 400/404/503) it tries the next model. If the key itself is out of
+quota or invalid (HTTP 403/429) it moves to the next key and starts again
+from the first model. If everything fails: a new email is skipped (with a
+Discord warning), and a reply that can't be classified is simply left
+unread until a later poll can classify it (or you approve it the other way).
+
+## 5. Discord bot setup
+
+1. Create an application + bot at the
+   [Discord Developer Portal](https://discord.com/developers/applications).
+2. Under **Bot**, enable **Message Content Intent**.
+3. Invite the bot to your server with `bot` scope and `Send Messages` /
+   `Read Message History` permissions.
+4. Get your own Discord **user ID** (enable Developer Mode in Discord
+   settings, right-click your name → Copy User ID) and the **channel ID**
+   you want it to post in (right-click channel → Copy Channel ID).
+5. Only your user ID can press the Print / Cancel / Print again / Reprint
+   buttons or run `!reprint` / `!status` — other members in the channel
+   can see the messages but not act on them.
+
+## 6. Email-based confirmation & who's allowed to approve
+
+Alongside the Discord message, the bot replies **in the same email
+thread** asking you to confirm, e.g.:
+
+> I think this email is asking to print the attached file(s): scan.jpg.
+> Reply with something like "yes, 2 copies" to confirm, or "no" to cancel.
+> You can also confirm on Discord.
+
+A later reply like *"yeah go ahead, 3 copies"* or *"nope, cancel that"* is
+interpreted by Gemini and acted on. **Whichever channel responds first
+wins** — if you tap Print in Discord, the bot won't also print because a
+reply happened to arrive moments later (and vice versa); both channels
+just get told the job is already being handled.
+
+**Who counts as a valid approval by email** is controlled by two settings
+in `config.yaml`:
+
+```yaml
+gmail:
+  approved_reply_senders: []              # e.g. ["spouse@example.com"]
+  allow_non_owner_email_approval: false
+```
+
+- **Your own address always counts** — this can't be disabled.
+- If `approved_reply_senders` is **non-empty**, only those addresses (plus
+  you) can approve/cancel/reprint — everyone else's replies are ignored.
+  This is the safest option if specific other people should be able to
+  approve prints.
+- Otherwise, `allow_non_owner_email_approval: true` lets **anyone** who
+  replies in the thread approve it — including whoever originally sent you
+  the attachment. Leave this `false` (the default) unless you specifically
+  want that; otherwise someone emailing you a file could approve printing
+  it themselves without you ever seeing a request.
+
+## 7. Configure
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Edit `config.yaml`. For secrets, either paste them directly or, better,
+keep them out of the file entirely using `ENV:VAR_NAME`:
+
+```yaml
+gemini:
+  api_keys:
+    - "ENV:GEMINI_API_KEY_1"
+    - "ENV:GEMINI_API_KEY_2"
+discord:
+  bot_token: "ENV:DISCORD_BOT_TOKEN"
+```
+
+and set those variables (e.g. in a systemd `EnvironmentFile`, see below).
+
+## 8. Run it
+
+```bash
+python3 main.py
+```
+
+You should see a "🖨️ Print bot is online" message in your Discord channel.
+
+## 9. Run it automatically on boot (systemd)
+
+`/etc/systemd/system/printbot.service`:
+
+```ini
+[Unit]
+Description=Gmail Print Bot
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/printbot
+EnvironmentFile=/home/pi/printbot/printbot.env
+ExecStart=/home/pi/printbot/venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`printbot.env` (keep this file `chmod 600`):
+
+```
+GEMINI_API_KEY_1=...
+GEMINI_API_KEY_2=...
+DISCORD_BOT_TOKEN=...
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now printbot
+sudo journalctl -u printbot -f     # logs
+```
+
+## Usage
+
+- The bot polls Gmail every `gmail.poll_interval_seconds` seconds (default
+  60) for **new** matching emails, and separately polls every pending
+  job's email thread on the same interval for **replies**.
+- For every new matching email, Gemini decides if it's a print request and
+  guesses a paper size.
+- If yes: attachments are downloaded.
+  - **Images** (photos, screenshots) are always combined into one PDF,
+    one image per page, scaled to fill the page, on **short bond paper**
+    — this combined PDF is attached to both the Discord message and the
+    email reply so you can check the bot got it right before approving.
+  - **Real documents/PDFs** get their paper size from the email text if
+    mentioned, otherwise auto-detected from the file's own dimensions,
+    otherwise the configured default.
+  - If a job ends up needing **both** paper sizes (e.g. an email with
+    photos plus a legal-size form), it prints the short-bond-paper part
+    first, then pauses and asks again — on both channels — for you to
+    swap in long bond paper before continuing.
+- You get a Discord message with **Print** / **Cancel** buttons, and a
+  reply in the email thread with the same information. Clicking **Print**
+  (or replying "yes") opens/asks for **how many copies** — leave it blank
+  to default to 1.
+- Whichever channel you respond on first is honored; both channels then
+  get an "approved via X — printing N copies" notice.
+- If printing fails (including if the printer isn't detected at all), you
+  get the specific error on **both** channels plus a **Reprint** button;
+  replying to the email also retries.
+- After a successful print, both channels offer **Print again** (asks for
+  copies again) any time — not just right after printing.
+- `!reprint <message_id> [copies]` — manually trigger a (re)print of any
+  past job (IDs shown in `!status`).
+- `!status` — list your 10 most recent jobs, their status, and copy count.
+
+## Customization notes
+
+- **Search query**: tighten `gmail.search_query` (e.g. add
+  `from:family@example.com`) to reduce how much gets sent to Gemini and
+  avoid burning through free-tier quota on irrelevant mail.
+- **Paper sizes**: the bot is intentionally locked to two choices (short
+  bond paper / long bond paper) to match a printer loaded with only those
+  two trays/stacks. Generated (image-combined) PDFs are always short bond
+  paper by design. If you ever need more paper options, add entries to
+  `printer.supported_paper_sizes`, `pdf_utils.PAPER_SIZES` /
+  `PAPER_SIZE_LABELS`, and `printer.CUPS_MEDIA_NAMES` together, and update
+  the allowed values in `ai_classifier.CLASSIFY_PROMPT_TEMPLATE`.
+- **Multiple attachments to print selectively**: currently the bot prints
+  *all* attachments on a matched email. If you want Gemini to pick specific
+  files, extend the JSON schema in `ai_classifier.CLASSIFY_PROMPT_TEMPLATE`
+  with a `target_attachments` field and filter in
+  `discord_bot.PrintBot._prepare_job`.
+- **Non-image, non-PDF attachments** (e.g. `.docx`) are sent to `lp`
+  as-is; whether that prints correctly depends on your CUPS filters. For
+  reliable results, converting office documents to PDF first (e.g. with
+  LibreOffice's `soffice --headless --convert-to pdf`) is recommended if
+  you expect those often.
+- **Attachment size limits for previews**: Discord (~25MB on most servers)
+  and Gmail (~25MB) both cap attachment size. A combined PDF from many
+  high-resolution photos could occasionally hit that; if it does, the bot
+  will report it rather than silently failing to attach.
+- **Email reply parsing**: `ai_classifier.classify_reply()` uses Gemini
+  rather than keyword matching, so replies like "go ahead" or "nah, don't
+  bother" work naturally — at the cost of one extra Gemini call per reply.
+- **Cancelled jobs are terminal**: once cancelled (via either channel),
+  further replies on that thread won't reopen it. If you want cancelled
+  jobs to also be reprintable, add `STATUS_CANCELLED` to the retry check
+  in `confirmation.ConfirmationManager.handle_approval`.
+
+## Recommendations
+
+- **Start with a narrow Gmail search query.** The free Gemini tier has
+  fairly low per-key, per-day request limits; scanning every attachment
+  email in your inbox will burn through it fast. A query like
+  `from:trusted@example.com has:attachment newer_than:1d` keeps volume low.
+- **Get 2–3 Gemini keys from separate Google accounts**, not the same
+  account's multiple projects — free-tier quota is often tied to the
+  account/billing profile, not just the project.
+- **Test printing manually first**: `lp -d Brother_DCP_J100 test.pdf`
+  before wiring up the bot, so you know CUPS + driver + media names are
+  correct.
+- **Back up `credentials/token.json`** somewhere safe — regenerating it
+  requires the browser flow again.
+- **Leave `allow_non_owner_email_approval` off** unless you have a
+  specific reason to let other people approve prints by replying — prefer
+  the `approved_reply_senders` whitelist if you want to allow a few
+  trusted people specifically.
+- **Consider a stricter owner check on Discord** if the bot's channel is
+  in a shared server — it already restricts button/command use to your
+  user ID, but you may also want to make the channel private.
+- **The Pi Zero 2 W is modest hardware.** Discord's gateway connection and
+  the two polling loops (new emails + confirmation replies) are
+  lightweight, but keep `poll_interval_seconds` at 60s or higher to avoid
+  unnecessary load and API usage.

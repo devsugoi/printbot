@@ -1,0 +1,73 @@
+# Copy this file to config.yaml and fill in your own values.
+# Any string value can be written as "ENV:SOME_VAR_NAME" to instead read it
+# from an environment variable at startup (useful for keeping secrets out of
+# the file, e.g. when using systemd EnvironmentFile).
+
+gmail:
+  # Downloaded from Google Cloud Console (OAuth 2.0 Client ID, "Desktop app" type)
+  credentials_file: "credentials/credentials.json"
+  # Created automatically the first time you authenticate
+  token_file: "credentials/token.json"
+  # Gmail search query used to find candidate emails. Keep it narrow so the
+  # bot + Gemini don't have to look at your whole inbox every poll.
+  search_query: "has:attachment newer_than:2d"
+  # How often to check Gmail for new print-request emails AND for replies
+  # confirming/cancelling pending ones, in seconds.
+  poll_interval_seconds: 60
+
+  # -- Email-based confirmation security ---------------------------------
+  # Your own Gmail address (auto-detected at startup) can ALWAYS approve,
+  # cancel, or reprint a job by replying in its thread. These two settings
+  # control whether anyone else's reply in that thread can too:
+  #
+  # If approved_reply_senders is non-empty, ONLY those addresses (plus your
+  # own) may approve/cancel/reprint -- this overrides the setting below.
+  approved_reply_senders: []
+  # If approved_reply_senders is empty, this decides whether ANY reply in
+  # the thread counts (true) or only your own address does (false, safer
+  # default). Turning this on means e.g. a family member who emailed you
+  # an attachment could also approve/cancel printing it themselves.
+  allow_non_owner_email_approval: false
+
+gemini:
+  # One or more API keys (Google AI Studio -> Get API key). The bot tries
+  # them in order and moves to the next one when a key hits its quota/limit.
+  api_keys:
+    - "ENV:GEMINI_API_KEY_1"
+    - "ENV:GEMINI_API_KEY_2"
+  # Models to try, in order of preference, per key. If a model is
+  # unavailable / overloaded / rate-limited, the bot falls back to the next
+  # one in the list before moving to the next API key.
+  models:
+    - "gemini-2.5-flash"
+    - "gemini-2.0-flash"
+    - "gemini-1.5-flash"
+
+discord:
+  bot_token: "ENV:DISCORD_BOT_TOKEN"
+  # Your personal Discord user ID. Only this user's button clicks / commands
+  # are accepted, so nobody else can approve prints on your printer.
+  user_id: 123456789012345678
+  # Channel the bot posts print requests / status updates to.
+  channel_id: 123456789012345678
+  # Command prefix for text commands like !reprint and !status
+  command_prefix: "!"
+
+printer:
+  # CUPS printer name as shown by `lpstat -p`, e.g. "Brother_DCP_J100"
+  name: "Brother_DCP_J100"
+  # The printer is only ever loaded with two paper choices. "Short" = short
+  # bond paper (8.5x11in / Letter), "Long" = long bond paper (8.5x14in /
+  # Legal). Used when the bot can't confidently decide which one to use.
+  default_paper_size: "Short"
+  supported_paper_sizes:
+    - "Short"
+    - "Long"
+
+storage:
+  jobs_dir: "jobs"                  # downloaded attachments + generated PDFs
+  state_file: "state.json"          # processed email ids + job history
+  # How many days a job's email thread keeps being watched for new replies
+  # (confirmations, cancellations, "print again"/reprint requests) before
+  # the bot stops polling it.
+  processed_email_retention_days: 30
