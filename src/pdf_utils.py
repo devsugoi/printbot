@@ -9,6 +9,8 @@ size detection via detect_pdf_paper_size / the AI classifier.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
@@ -148,3 +150,70 @@ def is_image_file(path: str) -> bool:
 
 def is_pdf_file(path: str) -> bool:
     return os.path.splitext(path)[1].lower() == ".pdf"
+
+
+# Office / rich-document formats that CUPS can't print directly but
+# LibreOffice can convert to PDF.
+OFFICE_EXTENSIONS = {
+    ".doc", ".docx", ".odt", ".rtf",
+    ".xls", ".xlsx", ".ods",
+    ".ppt", ".pptx", ".odp",
+}
+
+
+class OfficeConversionError(RuntimeError):
+    """Raised when an office document could not be converted to PDF."""
+
+
+def is_office_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in OFFICE_EXTENSIONS
+
+
+def converted_pdf_path(input_path: str) -> str:
+    """The path LibreOffice will write when converting `input_path` to PDF
+    in the same directory (basename with the extension swapped to .pdf)."""
+    base, _ = os.path.splitext(input_path)
+    return base + ".pdf"
+
+
+def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
+    """Converts an office document (.docx, .xlsx, ...) to PDF using
+    headless LibreOffice, returning the path of the generated PDF.
+
+    Raises OfficeConversionError if LibreOffice is not installed or the
+    conversion fails, with a message suitable for showing to the user.
+    """
+    output_dir = output_dir or os.path.dirname(input_path) or "."
+    binary = shutil.which("soffice") or shutil.which("libreoffice")
+    if binary is None:
+        raise OfficeConversionError(
+            f"Can't print {os.path.basename(input_path)}: LibreOffice is "
+            f"not installed, so it can't be converted to PDF. Install it "
+            f"with: sudo apt install -y libreoffice"
+        )
+
+    command = [
+        binary, "--headless",
+        "--convert-to", "pdf",
+        "--outdir", output_dir,
+        input_path,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        raise OfficeConversionError(
+            f"Converting {os.path.basename(input_path)} to PDF timed out."
+        )
+
+    expected = os.path.join(
+        output_dir, converted_pdf_path(os.path.basename(input_path))
+    )
+    if result.returncode != 0 or not os.path.exists(expected):
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OfficeConversionError(
+            f"Converting {os.path.basename(input_path)} to PDF failed"
+            + (f": {detail}" if detail else ".")
+        )
+    return expected

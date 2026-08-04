@@ -180,9 +180,13 @@ class ConfirmationManager:
             self.state.save_job(job)
 
             for f in files:
-                print_path, effective_size = await self._resolve_print_target(
-                    job, f
-                )
+                try:
+                    print_path, effective_size = await self._resolve_print_target(
+                        job, f
+                    )
+                except pdf_utils.OfficeConversionError as e:
+                    await self._fail_job(job, str(e), group_index)
+                    return
                 result = await asyncio.to_thread(
                     printer.print_file,
                     print_path, effective_size,
@@ -244,23 +248,39 @@ class ConfirmationManager:
     async def _resolve_print_target(
         self, job: PrintJob, f: PrintFile
     ) -> tuple[str, str]:
-        """Returns (filepath, CUPS paper size) for a file, scaling Long PDFs
-        onto Short when the user chose fit_long_on_short."""
+        """Returns (filepath, CUPS paper size) for a file, converting office
+        documents to PDF and scaling Long PDFs onto Short when the user
+        chose fit_long_on_short.
+
+        Raises pdf_utils.OfficeConversionError if an office file can't be
+        converted (e.g. LibreOffice missing)."""
+        path = f.path
+        if pdf_utils.is_office_file(path):
+            # Jobs prepared before office->PDF conversion existed (or whose
+            # conversion failed at prepare time) still point at the raw
+            # office file -- convert here so reprints of those jobs work.
+            converted = pdf_utils.converted_pdf_path(path)
+            if not os.path.exists(converted):
+                converted = await asyncio.to_thread(
+                    pdf_utils.office_to_pdf, path, os.path.dirname(path)
+                )
+            path = converted
+
         effective_size = f.paper_size
         if job.fit_long_on_short and f.paper_size == "Long":
             effective_size = "Short"
-            if pdf_utils.is_pdf_file(f.path):
+            if pdf_utils.is_pdf_file(path):
                 if f.scaled_path and os.path.exists(f.scaled_path):
                     return f.scaled_path, effective_size
-                output_path = pdf_utils.scaled_pdf_path(f.path, "Short")
+                output_path = pdf_utils.scaled_pdf_path(path, "Short")
                 await asyncio.to_thread(
                     pdf_utils.scale_pdf_to_paper_size,
-                    f.path, output_path, "Short",
+                    path, output_path, "Short",
                 )
                 f.scaled_path = output_path
                 self.state.save_job(job)
                 return output_path, effective_size
-        return f.path, effective_size
+        return path, effective_size
 
     async def _fail_job(self, job: PrintJob, error_message: str, group_index: Optional[int] = None):
         if group_index is not None:

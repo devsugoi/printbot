@@ -70,8 +70,15 @@ printbot/
 ```bash
 sudo apt update
 sudo apt install -y cups cups-bsd printer-driver-brlaser python3-pip python3-venv git
+sudo apt install -y libreoffice   # converts .docx/.xlsx/... attachments to PDF for printing
 sudo usermod -aG lpadmin $USER   # then log out/in
 ```
+
+LibreOffice is required for printing office documents (Word, Excel,
+PowerPoint, OpenDocument, RTF): CUPS can't print those directly, so the
+bot converts them to PDF with `soffice --headless` first. On a
+storage-constrained Pi, `libreoffice-writer libreoffice-calc
+libreoffice-impress` covers the same formats with a smaller footprint.
 
 Install the Brother DCP-J100 driver and add the printer. Brother publishes
 Linux drivers for this model; alternatively `printer-driver-brlaser` (a
@@ -324,11 +331,19 @@ sudo journalctl -u printbot -f     # logs
   files, extend the JSON schema in `ai_classifier.CLASSIFY_PROMPT_TEMPLATE`
   with a `target_attachments` field and filter in
   `discord_bot.PrintBot._prepare_job`.
-- **Non-image, non-PDF attachments** (e.g. `.docx`) are sent to `lp`
-  as-is; whether that prints correctly depends on your CUPS filters. For
-  reliable results, converting office documents to PDF first (e.g. with
-  LibreOffice's `soffice --headless --convert-to pdf`) is recommended if
-  you expect those often.
+- **Office attachments** (`.doc`, `.docx`, `.odt`, `.rtf`, `.xls`,
+  `.xlsx`, `.ods`, `.ppt`, `.pptx`, `.odp`) are converted to PDF with
+  headless LibreOffice before printing, and the converted PDF is attached
+  to the confirmation message so you can check the rendering before
+  approving. This requires LibreOffice on the Pi (see setup step 1); if
+  it's missing or conversion fails, the job fails with a clear message
+  and can be reprinted after fixing the issue. Conversion also runs at
+  print time for jobs prepared before this feature (or whose prepare-time
+  conversion failed), so reprinting an old failed `.docx` job works.
+  Note that the print reflects LibreOffice's rendering, which can differ
+  slightly from Microsoft Word for complex layouts or missing fonts.
+- **Other non-image, non-PDF attachments** are still sent to `lp` as-is;
+  whether those print depends on your CUPS filters.
 - **Attachment size limits for previews**: Discord (~25MB on most servers)
   and Gmail (~25MB) both cap attachment size. A combined PDF from many
   high-resolution photos could occasionally hit that; if it does, the bot

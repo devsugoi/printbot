@@ -273,8 +273,39 @@ class PrintBot(commands.Bot):
             files.append(PrintFile(path=p, paper_size=size, is_generated=False))
 
         for p in other_paths:
-            # Non-PDF, non-image documents (e.g. .docx) -- best effort. See
-            # README for the caveat about non-PDF print reliability.
+            if pdf_utils.is_office_file(p):
+                # Office documents (.docx, .xlsx, ...) can't be printed by
+                # CUPS directly -- convert to PDF with LibreOffice. The
+                # converted PDF is marked is_generated so it's attached to
+                # the confirmation ask as a preview.
+                try:
+                    converted = await asyncio.to_thread(
+                        pdf_utils.office_to_pdf, p, job_dir
+                    )
+                except pdf_utils.OfficeConversionError:
+                    logger.exception(
+                        "Failed to convert %s to PDF at prepare time; "
+                        "queueing the original file (conversion will be "
+                        "retried at print time)", p,
+                    )
+                    files.append(
+                        PrintFile(
+                            path=p,
+                            paper_size=ai_paper_size or default,
+                            is_generated=False,
+                        )
+                    )
+                    continue
+                size = ai_paper_size or pdf_utils.detect_pdf_paper_size(
+                    converted, supported, default
+                )
+                files.append(
+                    PrintFile(path=converted, paper_size=size, is_generated=True)
+                )
+                continue
+
+            # Anything else -- best effort, sent to lp as-is. See README
+            # for the caveat about non-PDF print reliability.
             files.append(
                 PrintFile(path=p, paper_size=ai_paper_size or default, is_generated=False)
             )
