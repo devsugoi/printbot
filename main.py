@@ -34,7 +34,10 @@ def main():
     config = load_config(args.config)
 
     os.makedirs(config.storage.jobs_dir, exist_ok=True)
-    state = StateStore(config.storage.state_file)
+    state = StateStore(
+        config.storage.state_file,
+        config.storage.processed_email_retention_days,
+    )
 
     bot = PrintBot(config, state)
     bot.run(config.discord.bot_token)

@@ -190,8 +190,11 @@ class GeminiClassifier:
 
         for key_index, api_key in enumerate(self.api_keys):
             client = genai.Client(api_key=api_key)
+            skip_key = False
 
             for model_name in self.models:
+                if skip_key:
+                    break
                 for attempt in range(2):
                     try:
                         response = client.models.generate_content(
@@ -255,6 +258,7 @@ class GeminiClassifier:
                                 e,
                             )
                             last_error = e
+                            skip_key = True
                             break  # stop trying models for this key
 
                         logger.warning(
@@ -374,36 +378,3 @@ class GeminiClassifier:
             "paper_size": paper_size,
             "reason": reason,
         }
-
-    @staticmethod
-    def _parse_classification(raw_text: str) -> ClassificationResult:
-        try:
-            data = json.loads(raw_text)
-            return GeminiClassifier._classification_from_data(data)
-        except (json.JSONDecodeError, TypeError, AttributeError) as e:
-            recovered = GeminiClassifier._recover_classification_dict(raw_text)
-            if recovered is not None:
-                logger.warning(
-                    "Recovered print-request classification from malformed JSON"
-                )
-                return GeminiClassifier._classification_from_data(recovered)
-
-            logger.error("Could not parse Gemini response as JSON: %r", raw_text)
-            # Fail safe: treat unparsable responses as "not a print request"
-            # rather than risk mis-printing something.
-            return ClassificationResult(
-                is_print_request=False,
-                paper_size=None,
-                reason=f"Failed to parse model response: {e}",
-            )
-
-    @staticmethod
-    def _parse_reply(raw_text: str) -> ReplyDecision:
-        try:
-            data = json.loads(raw_text)
-            return GeminiClassifier._reply_from_data(data)
-        except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as e:
-            logger.error(
-                "Could not parse Gemini reply response as JSON: %r (%s)", raw_text, e
-            )
-            return ReplyDecision(decision="unclear", copies=None, fit_on_short=None)

@@ -27,6 +27,7 @@ import socket
 import threading
 
 import httplib2
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_httplib2 import AuthorizedHttp
@@ -96,6 +97,12 @@ class EmailMessage:
 
 
 @dataclass
+class SendReplyResult:
+    rfc_message_id: str
+    internal_date_ms: int
+
+
+@dataclass
 class ThreadReply:
     from_address: str
     body_text: str
@@ -122,8 +129,14 @@ def get_gmail_service(credentials_file: str, token_file: str):
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                logger.warning(
+                    "Saved Gmail token refresh failed; re-running OAuth flow."
+                )
+                creds = None
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
                 credentials_file, SCOPES
             )
@@ -372,10 +385,10 @@ def send_reply(
     in_reply_to_rfc_id: str,
     body_text: str,
     attachment_paths: list[str] | None = None,
-) -> str:
-    """Sends a reply within an existing Gmail thread. Returns the Message-Id
-    (RFC header, not the Gmail id) of the message we just sent, so it can be
-    used as In-Reply-To for any further reply in the same job."""
+) -> SendReplyResult:
+    """Sends a reply within an existing Gmail thread. Returns the RFC
+    Message-Id and the sent message's Gmail internalDate (for reply
+    watermarking)."""
     msg = MIMEMultipart()
     msg["To"] = to_address
     msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -403,14 +416,24 @@ def send_reply(
     # send a duplicate confirmation email. That's a minor annoyance
     # compared to silently dropping a confirmation/result message, so it
     # still retries here.
-    _execute(
+    sent = _execute(
         service,
         service.users().messages().send(
             userId="me", body={"raw": raw, "threadId": thread_id}
         ),
     )
+    meta = _execute(
+        service,
+        service.users().messages().get(
+            userId="me", id=sent["id"], format="minimal"
+        ),
+    )
+    internal_date_ms = int(meta.get("internalDate", "0"))
 
-    return own_rfc_id
+    return SendReplyResult(
+        rfc_message_id=own_rfc_id,
+        internal_date_ms=internal_date_ms,
+    )
 
 
 def list_new_thread_replies(

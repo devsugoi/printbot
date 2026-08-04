@@ -14,6 +14,7 @@ import subprocess
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
+from reportlab.lib.utils import ImageReader
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
@@ -59,8 +60,7 @@ def images_to_pdf(image_paths: list[str], output_path: str, paper_size_pt: tuple
             y = (page_height - draw_h) / 2
 
             c.drawImage(
-                path, x, y, width=draw_w, height=draw_h,
-                preserveAspectRatio=True, anchor="c",
+                ImageReader(img), x, y, width=draw_w, height=draw_h,
             )
         c.showPage()
 

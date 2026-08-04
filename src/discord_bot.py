@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 import discord
@@ -53,6 +54,7 @@ class PrintBot(commands.Bot):
         self.owner_email = ""           # set in setup_hook
         self.confirmation: Optional[ConfirmationManager] = None
         self._notify_channel: discord.abc.Messageable | None = None
+        self._announced_online = False
 
         self._register_commands()
 
@@ -83,6 +85,27 @@ class PrintBot(commands.Bot):
         self.poll_gmail.start()
         self.poll_email_replies.change_interval(seconds=interval)
         self.poll_email_replies.start()
+
+    @poll_gmail.before_loop
+    async def _before_poll_gmail(self):
+        await self.wait_until_ready()
+
+    @poll_email_replies.before_loop
+    async def _before_poll_email_replies(self):
+        await self.wait_until_ready()
+
+    async def _ensure_notify_channel(self) -> discord.abc.Messageable | None:
+        if self._notify_channel is not None:
+            return self._notify_channel
+        channel = self.get_channel(self.app_config.discord.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.app_config.discord.channel_id)
+            except discord.DiscordException:
+                logger.exception("Could not resolve Discord notify channel")
+                return None
+        self._notify_channel = channel
+        return channel
 
     def _recover_interrupted_jobs(self):
         """If the bot crashed or was restarted while a job was mid-print
@@ -136,15 +159,19 @@ class PrintBot(commands.Bot):
 
     async def on_ready(self):
         logger.info("Logged in as %s (owner mailbox: %s)", self.user, self.owner_email)
-        self._notify_channel = self.get_channel(self.app_config.discord.channel_id)
-        if self._notify_channel is None:
-            self._notify_channel = await self.fetch_channel(
-                self.app_config.discord.channel_id
+        channel = await self._ensure_notify_channel()
+        if channel is None:
+            logger.error(
+                "Discord channel %s not found; notifications will be dropped.",
+                self.app_config.discord.channel_id,
             )
-        await self._notify_channel.send(
-            "🖨️ Print bot is online — watching Gmail for print requests and "
-            "this channel + email for confirmations."
-        )
+            return
+        if not self._announced_online:
+            self._announced_online = True
+            await channel.send(
+                "🖨️ Print bot is online — watching Gmail for print requests and "
+                "this channel + email for confirmations."
+            )
 
     def _is_owner(self, user: discord.abc.User) -> bool:
         return user.id == self.app_config.discord.user_id
@@ -228,11 +255,13 @@ class PrintBot(commands.Bot):
             )
         except AllKeysExhaustedError as e:
             logger.error("Gemini classification failed for %s: %s", message_id, e)
-            await self._notify_channel.send(
-                f"⚠️ Couldn't check an email (\"{email.subject}\") because all "
-                f"Gemini API keys/models are currently unavailable. It will "
-                f"be skipped. Error: {e}"
-            )
+            channel = await self._ensure_notify_channel()
+            if channel is not None:
+                await channel.send(
+                    f"⚠️ Couldn't check an email (\"{email.subject}\") because all "
+                    f"Gemini API keys/models are currently unavailable. It will "
+                    f"be skipped. Error: {e}"
+                )
             return
 
         if not result.is_print_request:
@@ -252,8 +281,10 @@ class PrintBot(commands.Bot):
         default = self.app_config.printer.default_paper_size
 
         downloaded_paths = []
+        used_filenames: set[str] = set()
         for attachment in email.attachments:
-            dest = os.path.join(job_dir, attachment.filename)
+            safe_name = _safe_attachment_filename(attachment.filename, used_filenames)
+            dest = os.path.join(job_dir, safe_name)
             await asyncio.to_thread(
                 gmail_client.download_attachment,
                 self.gmail_service, email.message_id, attachment, dest,
@@ -433,7 +464,7 @@ class PrintBot(commands.Bot):
                         "Could not classify email reply for job %s: %s",
                         job.message_id, e,
                     )
-                    continue
+                    break
 
                 # Re-fetch in case an earlier reply in this same batch (or
                 # a Discord click) already changed the job.
@@ -468,7 +499,8 @@ class PrintBot(commands.Bot):
     async def _post_notification(
         self, job: PrintJob, text: str, file_paths: Optional[list[str]]
     ):
-        if self._notify_channel is None:
+        channel = await self._ensure_notify_channel()
+        if channel is None:
             return
 
         view = None
@@ -498,7 +530,7 @@ class PrintBot(commands.Bot):
         if existing_files:
             send_kwargs["files"] = [discord.File(p) for p in existing_files]
 
-        await self._notify_channel.send(**send_kwargs)
+        await channel.send(**send_kwargs)
 
     # -- text commands ------------------------------------------------
 
@@ -515,7 +547,10 @@ class PrintBot(commands.Bot):
                 f"`{j.message_id}` [{j.status}] {j.subject} ({j.copies}x)"
                 for j in jobs
             ]
-            await ctx.send("**Recent jobs:**\n" + "\n".join(lines))
+            text = "**Recent jobs:**\n" + "\n".join(lines)
+            if len(text) > 2000:
+                text = text[:1997] + "..."
+            await ctx.send(text)
 
         @self.command(name="reprint")
         async def reprint_cmd(ctx: commands.Context, message_id: str, copies: Optional[int] = None):
@@ -526,10 +561,14 @@ class PrintBot(commands.Bot):
                 await ctx.send(f"No job found for id `{message_id}`.")
                 return
             await ctx.send(f"Working on **{job.subject}**...")
-            await self.confirmation.handle_approval(
+            accepted = await self.confirmation.handle_approval(
                 message_id, source="discord", actor=str(ctx.author),
                 copies=copies, is_explicit_retry=True,
             )
+            if not accepted:
+                await ctx.send(
+                    f"Cannot reprint job `{message_id}` (status: `{job.status}`)."
+                )
 
 
 class CopiesModal(discord.ui.Modal):
@@ -669,3 +708,20 @@ class ActionView(discord.ui.View):
                 default_copies=self.default_copies, is_explicit_retry=True,
             )
         )
+
+
+def _safe_attachment_filename(filename: str, used_names: set[str]) -> str:
+    """Sanitize an email attachment filename for safe local storage."""
+    base = os.path.basename(filename or "attachment")
+    base = re.sub(r"[^\w.\- ]", "_", base).strip() or "attachment"
+    if base in (".", ".."):
+        base = "attachment"
+
+    name, ext = os.path.splitext(base)
+    candidate = base
+    counter = 1
+    while candidate.lower() in used_names:
+        candidate = f"{name}-{counter}{ext}"
+        counter += 1
+    used_names.add(candidate.lower())
+    return candidate

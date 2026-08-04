@@ -66,7 +66,7 @@ class ConfirmationManager:
         copies: Optional[int] = None,
         is_explicit_retry: bool = False,
         fit_long_on_short: Optional[bool] = None,
-    ):
+    ) -> bool:
         """source is "discord" or "email"; actor is a user tag or email
         address, shown in the "approved via" notification.
 
@@ -85,7 +85,7 @@ class ConfirmationManager:
         async with self._lock_for(message_id):
             job = self.state.get_job(message_id)
             if job is None:
-                return
+                return False
 
             currently_awaiting = job.status == STATUS_AWAITING_CONFIRMATION
             retry_eligible = is_explicit_retry and job.status in (STATUS_PRINTED, STATUS_FAILED)
@@ -95,7 +95,7 @@ class ConfirmationManager:
                     "Ignoring redundant approval for job %s (status=%s, via=%s/%s)",
                     message_id, job.status, source, actor,
                 )
-                return
+                return False
 
             if job.status == STATUS_PRINTED:
                 # A full "print again" after a previous success starts over.
@@ -130,6 +130,7 @@ class ConfirmationManager:
             )
 
             await self._print_job(job)
+            return True
 
     async def handle_cancel(self, message_id: str, source: str, actor: str):
         async with self._lock_for(message_id):
@@ -320,11 +321,14 @@ class ConfirmationManager:
         tasks = [self._notify_email(job, email_text, file_paths)]
         if self.on_notify_discord:
             tasks.append(self.on_notify_discord(job, discord_text, file_paths))
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error("Notification task failed", exc_info=result)
 
     async def _notify_email(self, job: PrintJob, text: str, file_paths: Optional[list[str]]):
         try:
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 gmail_client.send_reply,
                 self.gmail_service,
                 job.reply_to_address,
@@ -334,8 +338,10 @@ class ConfirmationManager:
                 text,
                 file_paths,
             )
-            job.last_seen_internal_date_ms = int(time.time() * 1000)
-            self.state.save_job(job)
+            if result.internal_date_ms > 0:
+                self.state.update_last_seen_internal_date(
+                    job.message_id, result.internal_date_ms
+                )
         except Exception:
             logger.exception(
                 "Failed to send email notification for job %s", job.message_id
