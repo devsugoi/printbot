@@ -59,6 +59,7 @@ REPLY_RESPONSE_SCHEMA = {
             "enum": ["approve", "cancel", "unclear"],
         },
         "copies": {"type": "integer", "nullable": True},
+        "fit_on_short": {"type": "boolean", "nullable": True},
     },
     "required": ["decision"],
 }
@@ -112,7 +113,8 @@ Respond with ONLY a JSON object (no markdown, no extra text) matching this \
 exact shape:
 {{
   "decision": "approve" or "cancel" or "unclear",
-  "copies": an integer number of copies if one is mentioned, or null
+  "copies": an integer number of copies if one is mentioned, or null,
+  "fit_on_short": true or false or null
 }}
 
 Rules:
@@ -122,6 +124,10 @@ Rules:
 "cancel", "stop", "don't print that").
 - "unclear" if the reply doesn't clearly indicate either.
 - copies should be null unless a specific number of copies is mentioned.
+- fit_on_short should be true only if the person explicitly wants to print \
+on short/letter bond paper instead of swapping in long bond paper (e.g. \
+"use short bond", "print on letter", "fit on short", "don't swap paper"). \
+Return false or null for a normal approval.
 
 Reply text:
 ---
@@ -141,6 +147,7 @@ class ClassificationResult:
 class ReplyDecision:
     decision: str  # "approve" | "cancel" | "unclear"
     copies: Optional[int]
+    fit_on_short: Optional[bool] = None
 
 
 class AllKeysExhaustedError(RuntimeError):
@@ -334,9 +341,13 @@ class GeminiClassifier:
         decision = str(data.get("decision", "unclear"))
         if decision not in ("approve", "cancel", "unclear"):
             decision = "unclear"
+        fit_on_short = data.get("fit_on_short")
+        if fit_on_short is not None:
+            fit_on_short = bool(fit_on_short)
         return ReplyDecision(
             decision=decision,
             copies=int(copies) if copies is not None else None,
+            fit_on_short=fit_on_short,
         )
 
     @staticmethod
@@ -395,4 +406,4 @@ class GeminiClassifier:
             logger.error(
                 "Could not parse Gemini reply response as JSON: %r (%s)", raw_text, e
             )
-            return ReplyDecision(decision="unclear", copies=None)
+            return ReplyDecision(decision="unclear", copies=None, fit_on_short=None)

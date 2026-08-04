@@ -116,7 +116,10 @@ class PrintBot(commands.Bot):
         )
         for job in jobs:
             if job.status == STATUS_AWAITING_CONFIRMATION:
-                self.add_view(ConfirmView(self.confirmation, job.message_id, owner_id))
+                self.add_view(ConfirmView(
+                    self.confirmation, job.message_id, owner_id,
+                    has_long_paper=job.has_long_paper_pending(),
+                ))
             elif job.status == STATUS_PRINTED:
                 self.add_view(ActionView(
                     self.confirmation, job.message_id, owner_id,
@@ -320,7 +323,8 @@ class PrintBot(commands.Bot):
             return (
                 '⚠️ This needs **long bond paper** (8.5"x14") at some point. '
                 "The tray usually has short bond paper loaded — have long "
-                "bond paper ready to swap in."
+                "bond paper ready to swap in. Or click **Print on short bond** / "
+                'reply "use short bond" to scale it onto the paper already loaded.'
             )
         return ""
 
@@ -390,10 +394,12 @@ class PrintBot(commands.Bot):
                 is_explicit_retry = current.status != STATUS_AWAITING_CONFIRMATION
 
                 if decision.decision == "approve":
+                    fit_short = decision.fit_on_short if decision.fit_on_short else None
                     await self.confirmation.handle_approval(
                         job.message_id, source="email",
                         actor=reply.from_address, copies=decision.copies,
                         is_explicit_retry=is_explicit_retry,
+                        fit_long_on_short=fit_short,
                     )
                 elif decision.decision == "cancel":
                     await self.confirmation.handle_cancel(
@@ -412,7 +418,10 @@ class PrintBot(commands.Bot):
         view = None
         owner_id = self.app_config.discord.user_id
         if job.status == STATUS_AWAITING_CONFIRMATION:
-            view = ConfirmView(self.confirmation, job.message_id, owner_id)
+            view = ConfirmView(
+                self.confirmation, job.message_id, owner_id,
+                has_long_paper=job.has_long_paper_pending(),
+            )
         elif job.status == STATUS_PRINTED:
             view = ActionView(
                 self.confirmation, job.message_id, owner_id,
@@ -475,11 +484,14 @@ class CopiesModal(discord.ui.Modal):
     def __init__(
         self, confirmation: ConfirmationManager, message_id: str,
         default_copies: int = 1, is_explicit_retry: bool = False,
+        fit_long_on_short: bool = False,
+        title: str = "How many copies?",
     ):
-        super().__init__(title="How many copies?")
+        super().__init__(title=title)
         self.confirmation = confirmation
         self.message_id = message_id
         self.is_explicit_retry = is_explicit_retry
+        self.fit_long_on_short = fit_long_on_short
         self.copies_input = discord.ui.TextInput(
             label="Number of copies",
             default=str(default_copies),
@@ -495,24 +507,46 @@ class CopiesModal(discord.ui.Modal):
         await interaction.response.send_message(
             "Got it — working on it now.", ephemeral=True
         )
+        fit_short = True if self.fit_long_on_short else None
         await self.confirmation.handle_approval(
             self.message_id, source="discord", actor=str(interaction.user),
             copies=copies, is_explicit_retry=self.is_explicit_retry,
+            fit_long_on_short=fit_short,
         )
 
 
 class ConfirmView(discord.ui.View):
-    def __init__(self, confirmation: ConfirmationManager, message_id: str, owner_id: int):
-        super().__init__(timeout=None)  # confirmations can wait indefinitely
+    def __init__(
+        self, confirmation: ConfirmationManager, message_id: str,
+        owner_id: int, has_long_paper: bool = False,
+    ):
+        super().__init__(timeout=None)
         self.confirmation = confirmation
         self.message_id = message_id
         self.owner_id = owner_id
-        # Deterministic (rather than the library's default random)
-        # custom_ids, so a freshly re-registered view after a bot restart
-        # (see setup_hook) matches the buttons on an already-sent message
-        # and old "Print"/"Cancel" clicks keep working indefinitely.
-        self.confirm.custom_id = f"printbot:confirm:{message_id}"
-        self.cancel.custom_id = f"printbot:cancel:{message_id}"
+
+        print_btn = discord.ui.Button(
+            label="Print", style=discord.ButtonStyle.success, emoji="🖨️",
+            custom_id=f"printbot:confirm:{message_id}",
+        )
+        print_btn.callback = self._on_print
+        self.add_item(print_btn)
+
+        if has_long_paper:
+            short_btn = discord.ui.Button(
+                label="Print on short bond", style=discord.ButtonStyle.primary,
+                emoji="📄",
+                custom_id=f"printbot:confirm-short:{message_id}",
+            )
+            short_btn.callback = self._on_print_short
+            self.add_item(short_btn)
+
+        cancel_btn = discord.ui.Button(
+            label="Cancel", style=discord.ButtonStyle.danger, emoji="🚫",
+            custom_id=f"printbot:cancel:{message_id}",
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -522,14 +556,21 @@ class ConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Print", style=discord.ButtonStyle.success, emoji="🖨️")
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_print(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
             CopiesModal(self.confirmation, self.message_id)
         )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🚫")
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_print_short(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            CopiesModal(
+                self.confirmation, self.message_id,
+                fit_long_on_short=True,
+                title="Print on short bond (scaled to fit)",
+            )
+        )
+
+    async def _on_cancel(self, interaction: discord.Interaction):
         await interaction.response.defer()
         await self.confirmation.handle_cancel(
             self.message_id, source="discord", actor=str(interaction.user)

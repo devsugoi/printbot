@@ -41,6 +41,7 @@ class PrintFile:
     paper_size: str            # "Short" or "Long"
     is_generated: bool = False  # True if the bot built this file itself
                                  # (e.g. images combined into one PDF)
+    scaled_path: Optional[str] = None  # Letter-fit PDF when Long -> Short
 
 
 @dataclass
@@ -64,6 +65,7 @@ class PrintJob:
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
     attempts: int = 0
+    fit_long_on_short: bool = False  # scale Long content onto Short paper
 
     def paper_size_groups(self) -> list[tuple[str, list[PrintFile]]]:
         """Groups files by paper size, preserving first-seen order. Most
@@ -84,6 +86,13 @@ class PrintJob:
 
     def generated_files(self) -> list[PrintFile]:
         return [f for f in self.files if f.is_generated]
+
+    def has_long_paper_pending(self) -> bool:
+        """True if any not-yet-printed group needs long bond paper."""
+        groups = self.paper_size_groups()
+        if self.current_group_index >= len(groups):
+            return False
+        return any(g[0] == "Long" for g in groups[self.current_group_index:])
 
 
 def _job_to_dict(job: PrintJob) -> dict:

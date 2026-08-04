@@ -279,10 +279,15 @@ sudo journalctl -u printbot -f     # logs
     photos plus a legal-size form), it prints the short-bond-paper part
     first, then pauses and asks again — on both channels — for you to
     swap in long bond paper before continuing.
-- You get a Discord message with **Print** / **Cancel** buttons, and a
-  reply in the email thread with the same information. Clicking **Print**
-  (or replying "yes") opens/asks for **how many copies** — leave it blank
-  to default to 1.
+  - If a job needs **long bond paper**, you can instead choose **Print on
+    short bond** (Discord button) or reply with something like "yes, use
+    short bond" — long-sized PDFs are scaled to fit letter paper so you
+    don't have to swap the tray.
+- You get a Discord message with **Print** / **Cancel** buttons (plus
+  **Print on short bond** when long paper is needed), and a reply in the
+  email thread with the same information. Clicking **Print** (or replying
+  "yes") opens/asks for **how many copies** — leave it blank to default to
+  1.
 - Whichever channel you respond on first is honored; both channels then
   get an "approved via X — printing N copies" notice.
 - If printing fails (including if the printer isn't detected at all), you
@@ -297,10 +302,10 @@ sudo journalctl -u printbot -f     # logs
   confirmation" until you respond — by email or Discord — whenever you get
   to it. Restarting the bot doesn't lose anything either: on startup it
   re-registers Discord buttons for every pending/printed/failed job within
-  `processed_email_retention_days` (so old "Print"/"Cancel"/"Reprint"
-  clicks keep working), and if it happens to restart mid-print, that job
-  is marked failed on the next startup so it's reprintable rather than
-  stuck.
+  `processed_email_retention_days` (so old "Print"/"Cancel"/"Print on short
+  bond"/"Reprint" clicks keep working), and if it happens to restart
+  mid-print, that job is marked failed on the next startup so it's
+  reprintable rather than stuck.
 
 ## Customization notes
 

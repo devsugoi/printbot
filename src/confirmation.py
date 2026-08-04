@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Awaitable, Callable, Optional
 
@@ -32,6 +33,7 @@ from .state import (
     STATUS_FAILED,
     STATUS_PRINTED,
     STATUS_PRINTING,
+    PrintFile,
     PrintJob,
     StateStore,
 )
@@ -63,6 +65,7 @@ class ConfirmationManager:
         actor: str,
         copies: Optional[int] = None,
         is_explicit_retry: bool = False,
+        fit_long_on_short: Optional[bool] = None,
     ):
         """source is "discord" or "email"; actor is a user tag or email
         address, shown in the "approved via" notification.
@@ -99,21 +102,30 @@ class ConfirmationManager:
                 job.current_group_index = 0
 
             job.copies = copies if copies is not None else (job.copies or 1)
+            if fit_long_on_short is not None:
+                job.fit_long_on_short = fit_long_on_short
+            elif currently_awaiting:
+                job.fit_long_on_short = False
             job.status = STATUS_CONFIRMED
             job.confirmed_via = source
             job.confirmed_by = actor
             self.state.save_job(job)
 
             plural = "y" if job.copies == 1 else "ies"
+            mode_note = (
+                " on short bond paper (scaled to fit)"
+                if job.fit_long_on_short
+                else ""
+            )
             await self.notify_both(
                 job,
                 discord_text=(
                     f"✅ Approved via {source} ({actor}) — printing "
-                    f"{job.copies} cop{plural}."
+                    f"{job.copies} cop{plural}{mode_note}."
                 ),
                 email_text=(
                     f"Approved via {source} ({actor}). Printing "
-                    f"{job.copies} cop{plural} now."
+                    f"{job.copies} cop{plural}{mode_note} now."
                 ),
             )
 
@@ -168,9 +180,13 @@ class ConfirmationManager:
             self.state.save_job(job)
 
             for f in files:
+                print_path, effective_size = await self._resolve_print_target(
+                    job, f
+                )
                 result = await asyncio.to_thread(
                     printer.print_file,
-                    f.path, paper_size, self.app_config.printer.name, job.copies,
+                    print_path, effective_size,
+                    self.app_config.printer.name, job.copies,
                 )
                 if not result.success:
                     await self._fail_job(job, result.message, group_index)
@@ -179,25 +195,33 @@ class ConfirmationManager:
             job.current_group_index = group_index + 1
             self.state.save_job(job)
 
-            if job.current_group_index < len(groups):
+            if (
+                job.current_group_index < len(groups)
+                and not job.fit_long_on_short
+            ):
                 # More paper-size groups remain -- pause for a tray swap
                 # and re-enter the confirmation flow for the next group.
                 next_paper_size, _ = groups[job.current_group_index]
                 job.status = STATUS_AWAITING_CONFIRMATION
                 self.state.save_job(job)
+                short_option = (
+                    ' Or click **Print on short bond** / reply "use short '
+                    'bond" to scale the rest onto the paper already loaded.'
+                )
                 await self.notify_both(
                     job,
                     discord_text=(
                         f"📄 Printed the {pdf_utils.PAPER_SIZE_LABELS[paper_size]} "
                         f"part of **{job.subject}**. The rest needs "
                         f"{pdf_utils.PAPER_SIZE_LABELS[next_paper_size]} — swap "
-                        f"the tray, then confirm to continue."
+                        f"the tray, then confirm to continue.{short_option}"
                     ),
                     email_text=(
                         f"Printed the {pdf_utils.PAPER_SIZE_LABELS[paper_size]} "
                         f"part. The rest of this job needs "
                         f"{pdf_utils.PAPER_SIZE_LABELS[next_paper_size]} — please "
                         f"swap the paper in the tray, then reply to confirm."
+                        f'{short_option.replace("**", "")}'
                     ),
                 )
                 return
@@ -216,6 +240,27 @@ class ConfirmationManager:
                 f'"print again" any time to print another copy.'
             ),
         )
+
+    async def _resolve_print_target(
+        self, job: PrintJob, f: PrintFile
+    ) -> tuple[str, str]:
+        """Returns (filepath, CUPS paper size) for a file, scaling Long PDFs
+        onto Short when the user chose fit_long_on_short."""
+        effective_size = f.paper_size
+        if job.fit_long_on_short and f.paper_size == "Long":
+            effective_size = "Short"
+            if pdf_utils.is_pdf_file(f.path):
+                if f.scaled_path and os.path.exists(f.scaled_path):
+                    return f.scaled_path, effective_size
+                output_path = pdf_utils.scaled_pdf_path(f.path, "Short")
+                await asyncio.to_thread(
+                    pdf_utils.scale_pdf_to_paper_size,
+                    f.path, output_path, "Short",
+                )
+                f.scaled_path = output_path
+                self.state.save_job(job)
+                return output_path, effective_size
+        return f.path, effective_size
 
     async def _fail_job(self, job: PrintJob, error_message: str, group_index: Optional[int] = None):
         if group_index is not None:

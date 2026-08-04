@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 
 from PIL import Image
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
@@ -72,6 +72,47 @@ def _apply_exif_orientation(img: Image.Image) -> Image.Image:
         return ImageOps.exif_transpose(img)
     except Exception:
         return img
+
+
+def scaled_pdf_path(original_path: str, target_size: str) -> str:
+    """Returns a cache path for a PDF scaled to fit `target_size`."""
+    base, ext = os.path.splitext(original_path)
+    return f"{base}.{target_size.lower()}_fit{ext}"
+
+
+def scale_pdf_to_paper_size(
+    input_path: str, output_path: str, target_size: str
+) -> str:
+    """Scales each page of a PDF to fit within the target paper size,
+    preserving aspect ratio and centering content on a new page of that
+    size."""
+    if target_size not in PAPER_SIZES:
+        raise ValueError(f"Unsupported target paper size: {target_size}")
+
+    target_w, target_h = PAPER_SIZES[target_size]
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
+
+    for page in reader.pages:
+        page_w = float(page.mediabox.width)
+        page_h = float(page.mediabox.height)
+
+        scale = min(target_w / page_w, target_h / page_h)
+        scaled_w = page_w * scale
+        scaled_h = page_h * scale
+        tx = (target_w - scaled_w) / 2
+        ty = (target_h - scaled_h) / 2
+
+        page.add_transformation(
+            Transformation().scale(sx=scale, sy=scale).translate(tx=tx, ty=ty)
+        )
+        page.mediabox.lower_left = (0, 0)
+        page.mediabox.upper_right = (target_w, target_h)
+        writer.add_page(page)
+
+    with open(output_path, "wb") as out:
+        writer.write(out)
+    return output_path
 
 
 def detect_pdf_paper_size(pdf_path: str, supported_sizes: list[str], default: str) -> str:
