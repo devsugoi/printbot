@@ -86,14 +86,6 @@ class PrintBot(commands.Bot):
         self.poll_email_replies.change_interval(seconds=interval)
         self.poll_email_replies.start()
 
-    @poll_gmail.before_loop
-    async def _before_poll_gmail(self):
-        await self.wait_until_ready()
-
-    @poll_email_replies.before_loop
-    async def _before_poll_email_replies(self):
-        await self.wait_until_ready()
-
     async def _ensure_notify_channel(self) -> discord.abc.Messageable | None:
         if self._notify_channel is not None:
             return self._notify_channel
@@ -203,6 +195,10 @@ class PrintBot(commands.Bot):
                 )
             else:
                 logger.exception("Error while polling Gmail for new emails")
+
+    @poll_gmail.before_loop
+    async def _before_poll_gmail(self):
+        await self.wait_until_ready()
 
     async def _poll_gmail_once(self):
         message_ids = await asyncio.to_thread(
@@ -417,6 +413,10 @@ class PrintBot(commands.Bot):
                 )
             else:
                 logger.exception("Error while polling email replies")
+
+    @poll_email_replies.before_loop
+    async def _before_poll_email_replies(self):
+        await self.wait_until_ready()
 
     async def _poll_email_replies_once(self):
         jobs = self.state.jobs_awaiting_email_replies(
