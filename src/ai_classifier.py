@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from google import genai
 from google.genai import errors
@@ -40,6 +41,28 @@ MODEL_LEVEL_STATUS_CODES = {400, 404, 503}
 # the next key. 429 = quota/rate limit exceeded, 403 = key lacks access.
 KEY_LEVEL_STATUS_CODES = {403, 429}
 
+CLASSIFY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_print_request": {"type": "boolean"},
+        "paper_size": {"type": "string", "nullable": True},
+        "reason": {"type": "string"},
+    },
+    "required": ["is_print_request", "reason"],
+}
+
+REPLY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "enum": ["approve", "cancel", "unclear"],
+        },
+        "copies": {"type": "integer", "nullable": True},
+    },
+    "required": ["decision"],
+}
+
 CLASSIFY_PROMPT_TEMPLATE = """You are a filter for an email-to-printer bot. Decide \
 whether the email below is a request from the owner to print an attachment, \
 and which paper size it should be printed on.
@@ -53,12 +76,13 @@ exact shape:
 {{
   "is_print_request": true or false,
   "paper_size": "Short" or "Long" or null,
-  "reason": a short (<20 words) explanation of your decision
+  "reason": a short (<15 words) explanation of your decision
 }}
 
 Rules:
 - is_print_request should be true only if the email is clearly asking for \
 one or more of its own attachments to be printed.
+- The reason must be under 15 words and must not contain double quotes.
 - If the email or attachment names explicitly mention a paper size (e.g. \
 "legal size", "long bond paper", "letter size", "8.5x14", "folio"), map it \
 to "Short" or "Long" accordingly.
@@ -141,68 +165,218 @@ class GeminiClassifier:
             attachments=", ".join(attachment_names) or "(none)",
             body=body[:4000],  # keep prompts small; free tier has token limits
         )
-        raw_text = self._generate_json(prompt)
-        return self._parse_classification(raw_text)
+        data = self._generate_json(prompt, CLASSIFY_RESPONSE_SCHEMA)
+        return self._classification_from_data(data)
 
     def classify_reply(self, reply_text: str) -> ReplyDecision:
         prompt = REPLY_PROMPT_TEMPLATE.format(reply_text=reply_text[:2000])
-        raw_text = self._generate_json(prompt)
-        return self._parse_reply(raw_text)
+        data = self._generate_json(prompt, REPLY_RESPONSE_SCHEMA)
+        return self._reply_from_data(data)
 
     # -- shared fallback machinery ------------------------------------------
 
-    def _generate_json(self, prompt: str) -> str:
-        """Tries every (key, model) combination in order, returning the raw
-        text of the first successful response. Raises AllKeysExhaustedError
-        if nothing works."""
+    def _generate_json(self, prompt: str, response_schema: dict) -> dict:
+        """Tries every (key, model) combination in order, returning the
+        parsed JSON object from the first successful response. Raises
+        AllKeysExhaustedError if nothing works."""
         last_error: Optional[Exception] = None
 
         for key_index, api_key in enumerate(self.api_keys):
             client = genai.Client(api_key=api_key)
 
             for model_name in self.models:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config={"response_mime_type": "application/json"},
-                    )
-                    return response.text
+                for attempt in range(2):
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config={
+                                "response_mime_type": "application/json",
+                                "response_schema": response_schema,
+                                "max_output_tokens": 256,
+                            },
+                        )
+                        data, raw_text, finish_reason = self._extract_response_data(
+                            response
+                        )
 
-                except errors.APIError as e:
-                    code = getattr(e, "code", None)
+                        if data is not None and not self._was_truncated(finish_reason):
+                            return data
 
-                    if code in KEY_LEVEL_STATUS_CODES:
+                        if attempt == 0:
+                            logger.warning(
+                                "Gemini response unusable (model=%s, key #%d, "
+                                "finish_reason=%s, attempt=%d). Retrying.",
+                                model_name,
+                                key_index + 1,
+                                finish_reason,
+                                attempt + 1,
+                            )
+                            continue
+
+                        if data is not None:
+                            logger.warning(
+                                "Using Gemini response after retry despite "
+                                "finish_reason=%s (model=%s).",
+                                finish_reason,
+                                model_name,
+                            )
+                            return data
+
                         logger.warning(
-                            "Gemini API key #%d rejected/exhausted "
-                            "(HTTP %s): %s. Trying next key.",
-                            key_index + 1, code, e,
+                            "Gemini response unparseable after retry "
+                            "(model=%s, key #%d, finish_reason=%s): %r",
+                            model_name,
+                            key_index + 1,
+                            finish_reason,
+                            raw_text,
+                        )
+                        last_error = ValueError(
+                            f"Unparseable JSON from {model_name}"
+                        )
+                        break
+
+                    except errors.APIError as e:
+                        code = getattr(e, "code", None)
+
+                        if code in KEY_LEVEL_STATUS_CODES:
+                            logger.warning(
+                                "Gemini API key #%d rejected/exhausted "
+                                "(HTTP %s): %s. Trying next key.",
+                                key_index + 1,
+                                code,
+                                e,
+                            )
+                            last_error = e
+                            break  # stop trying models for this key
+
+                        logger.warning(
+                            "Gemini model '%s' unavailable (key #%d, HTTP %s): "
+                            "%s. Trying next model.",
+                            model_name,
+                            key_index + 1,
+                            code,
+                            e,
                         )
                         last_error = e
-                        break  # stop trying models for this key
-
-                    logger.warning(
-                        "Gemini model '%s' unavailable (key #%d, HTTP %s): "
-                        "%s. Trying next model.",
-                        model_name, key_index + 1, code, e,
-                    )
-                    last_error = e
-                    continue
+                        break  # API error: don't retry same model
 
         raise AllKeysExhaustedError(
             f"All Gemini API keys/models failed. Last error: {last_error}"
         )
 
     @staticmethod
+    def _extract_response_data(
+        response: Any,
+    ) -> tuple[Optional[dict], str, Optional[str]]:
+        raw_text = response.text or ""
+        finish_reason = GeminiClassifier._get_finish_reason(response)
+
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            data = GeminiClassifier._coerce_to_dict(parsed)
+            if data is not None:
+                return data, raw_text, finish_reason
+
+        if raw_text:
+            try:
+                data = json.loads(raw_text)
+                if isinstance(data, dict):
+                    return data, raw_text, finish_reason
+            except json.JSONDecodeError:
+                recovered = GeminiClassifier._recover_classification_dict(raw_text)
+                if recovered is not None:
+                    logger.warning(
+                        "Recovered classification from malformed Gemini JSON"
+                    )
+                    return recovered, raw_text, finish_reason
+
+        return None, raw_text, finish_reason
+
+    @staticmethod
+    def _coerce_to_dict(parsed: Any) -> Optional[dict]:
+        if isinstance(parsed, dict):
+            return parsed
+        model_dump = getattr(parsed, "model_dump", None)
+        if callable(model_dump):
+            data = model_dump()
+            return data if isinstance(data, dict) else None
+        return None
+
+    @staticmethod
+    def _get_finish_reason(response: Any) -> Optional[str]:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return None
+        finish_reason = getattr(candidates[0], "finish_reason", None)
+        if finish_reason is None:
+            return None
+        return str(finish_reason).split(".")[-1]
+
+    @staticmethod
+    def _was_truncated(finish_reason: Optional[str]) -> bool:
+        return finish_reason == "MAX_TOKENS"
+
+    @staticmethod
+    def _classification_from_data(data: dict) -> ClassificationResult:
+        paper_size = data.get("paper_size") or None
+        if paper_size not in (None, "Short", "Long"):
+            paper_size = None
+        return ClassificationResult(
+            is_print_request=bool(data.get("is_print_request", False)),
+            paper_size=paper_size,
+            reason=str(data.get("reason", "")),
+        )
+
+    @staticmethod
+    def _reply_from_data(data: dict) -> ReplyDecision:
+        copies = data.get("copies")
+        decision = str(data.get("decision", "unclear"))
+        if decision not in ("approve", "cancel", "unclear"):
+            decision = "unclear"
+        return ReplyDecision(
+            decision=decision,
+            copies=int(copies) if copies is not None else None,
+        )
+
+    @staticmethod
+    def _recover_classification_dict(raw_text: str) -> Optional[dict]:
+        if not re.search(r'"is_print_request"\s*:\s*true\b', raw_text, re.IGNORECASE):
+            return None
+
+        paper_size = None
+        paper_match = re.search(
+            r'"paper_size"\s*:\s*"(Short|Long)"', raw_text, re.IGNORECASE
+        )
+        if paper_match:
+            paper_size = paper_match.group(1).capitalize()
+
+        reason_match = re.search(r'"reason"\s*:\s*"([^"]*)', raw_text)
+        reason = (
+            reason_match.group(1)
+            if reason_match
+            else "Recovered from partial model response"
+        )
+
+        return {
+            "is_print_request": True,
+            "paper_size": paper_size,
+            "reason": reason,
+        }
+
+    @staticmethod
     def _parse_classification(raw_text: str) -> ClassificationResult:
         try:
             data = json.loads(raw_text)
-            return ClassificationResult(
-                is_print_request=bool(data.get("is_print_request", False)),
-                paper_size=data.get("paper_size") or None,
-                reason=str(data.get("reason", "")),
-            )
+            return GeminiClassifier._classification_from_data(data)
         except (json.JSONDecodeError, TypeError, AttributeError) as e:
+            recovered = GeminiClassifier._recover_classification_dict(raw_text)
+            if recovered is not None:
+                logger.warning(
+                    "Recovered print-request classification from malformed JSON"
+                )
+                return GeminiClassifier._classification_from_data(recovered)
+
             logger.error("Could not parse Gemini response as JSON: %r", raw_text)
             # Fail safe: treat unparsable responses as "not a print request"
             # rather than risk mis-printing something.
@@ -216,11 +390,7 @@ class GeminiClassifier:
     def _parse_reply(raw_text: str) -> ReplyDecision:
         try:
             data = json.loads(raw_text)
-            copies = data.get("copies")
-            return ReplyDecision(
-                decision=str(data.get("decision", "unclear")),
-                copies=int(copies) if copies is not None else None,
-            )
+            return GeminiClassifier._reply_from_data(data)
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as e:
             logger.error(
                 "Could not parse Gemini reply response as JSON: %r (%s)", raw_text, e
