@@ -293,6 +293,14 @@ sudo journalctl -u printbot -f     # logs
 - `!reprint <message_id> [copies]` — manually trigger a (re)print of any
   past job (IDs shown in `!status`).
 - `!status` — list your 10 most recent jobs, their status, and copy count.
+- **There's no time limit on confirming.** A job just sits at "awaiting
+  confirmation" until you respond — by email or Discord — whenever you get
+  to it. Restarting the bot doesn't lose anything either: on startup it
+  re-registers Discord buttons for every pending/printed/failed job within
+  `processed_email_retention_days` (so old "Print"/"Cancel"/"Reprint"
+  clicks keep working), and if it happens to restart mid-print, that job
+  is marked failed on the next startup so it's reprintable rather than
+  stuck.
 
 ## Customization notes
 

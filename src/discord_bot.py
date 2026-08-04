@@ -26,8 +26,10 @@ from .config import AppConfig
 from .confirmation import ConfirmationManager
 from .state import (
     STATUS_AWAITING_CONFIRMATION,
+    STATUS_CONFIRMED,
     STATUS_FAILED,
     STATUS_PRINTED,
+    STATUS_PRINTING,
     PrintFile,
     PrintJob,
     StateStore,
@@ -73,11 +75,61 @@ class PrintBot(commands.Bot):
         )
         self.confirmation.on_notify_discord = self._post_notification
 
+        self._recover_interrupted_jobs()
+        self._reregister_persistent_views()
+
         interval = self.app_config.gmail.poll_interval_seconds
         self.poll_gmail.change_interval(seconds=interval)
         self.poll_gmail.start()
         self.poll_email_replies.change_interval(seconds=interval)
         self.poll_email_replies.start()
+
+    def _recover_interrupted_jobs(self):
+        """If the bot crashed or was restarted while a job was mid-print
+        (status "confirmed" or "printing"), that job would otherwise be
+        stuck forever -- neither channel currently offers a way to act on
+        those transient statuses. Treat them as failed so the normal
+        Reprint path (button + email reply) picks them back up."""
+        for job in self.state.all_jobs():
+            if job.status in (STATUS_CONFIRMED, STATUS_PRINTING):
+                logger.warning(
+                    "Job %s was interrupted mid-print (status=%s) by a "
+                    "restart; marking failed so it can be reprinted.",
+                    job.message_id, job.status,
+                )
+                job.status = STATUS_FAILED
+                job.last_error = "Interrupted by a bot restart before printing finished."
+                self.state.save_job(job)
+
+    def _reregister_persistent_views(self):
+        """Discord buttons only route to a view object that's currently
+        registered in this process. Without this, restarting the bot
+        would leave every previously-sent "Print"/"Cancel"/"Reprint"
+        button on old messages non-functional -- clicking one shows
+        Discord's generic "This interaction failed" with nothing logged
+        here, since the interaction never reaches our code. Re-adding a
+        matching view (same custom_ids, see ConfirmView/ActionView) for
+        every job that could still have a live button fixes that."""
+        owner_id = self.app_config.discord.user_id
+        jobs = self.state.jobs_awaiting_email_replies(
+            self.app_config.storage.processed_email_retention_days
+        )
+        for job in jobs:
+            if job.status == STATUS_AWAITING_CONFIRMATION:
+                self.add_view(ConfirmView(self.confirmation, job.message_id, owner_id))
+            elif job.status == STATUS_PRINTED:
+                self.add_view(ActionView(
+                    self.confirmation, job.message_id, owner_id,
+                    label="Print again", style=discord.ButtonStyle.primary,
+                    default_copies=job.copies,
+                ))
+            elif job.status == STATUS_FAILED:
+                self.add_view(ActionView(
+                    self.confirmation, job.message_id, owner_id,
+                    label="Reprint", style=discord.ButtonStyle.danger,
+                    default_copies=job.copies,
+                ))
+        logger.info("Re-registered Discord views for %d job(s)", len(jobs))
 
     async def on_ready(self):
         logger.info("Logged in as %s (owner mailbox: %s)", self.user, self.owner_email)
@@ -126,10 +178,21 @@ class PrintBot(commands.Bot):
         for message_id in message_ids:
             if self.state.is_processed(message_id):
                 continue
-            # Mark processed immediately so a crash mid-loop can't cause us
-            # to re-ask about the same email forever.
+            try:
+                await self._handle_candidate_message(message_id)
+            except Exception:
+                # Leave it unmarked so a transient failure (network, etc.)
+                # gets retried next poll instead of being silently
+                # skipped forever -- and don't let it stop the rest of
+                # this batch from being checked.
+                logger.exception(
+                    "Failed to handle candidate message %s -- will retry next poll",
+                    message_id,
+                )
+                continue
+            # Only mark processed once handling actually completed (found
+            # a print request and asked about it, or decided it wasn't one).
             self.state.mark_processed(message_id)
-            await self._handle_candidate_message(message_id)
 
     async def _handle_candidate_message(self, message_id: str):
         email = await asyncio.to_thread(
@@ -282,9 +345,13 @@ class PrintBot(commands.Bot):
                     self.gmail_service, job.thread_id, job.last_seen_internal_date_ms,
                 )
             except Exception:
+                # A transient error (e.g. a network hiccup) fetching one
+                # job's thread shouldn't stop every other job from being
+                # checked this cycle -- log it and move on; it'll be
+                # retried next poll.
                 logger.exception(
-                    "Failed to poll thread %s for job %s, skipping",
-                    job.thread_id, job.message_id,
+                    "Failed to fetch replies for job %s -- will retry next poll",
+                    job.message_id,
                 )
                 continue
 
@@ -440,6 +507,12 @@ class ConfirmView(discord.ui.View):
         self.confirmation = confirmation
         self.message_id = message_id
         self.owner_id = owner_id
+        # Deterministic (rather than the library's default random)
+        # custom_ids, so a freshly re-registered view after a bot restart
+        # (see setup_hook) matches the buttons on an already-sent message
+        # and old "Print"/"Cancel" clicks keep working indefinitely.
+        self.confirm.custom_id = f"printbot:confirm:{message_id}"
+        self.cancel.custom_id = f"printbot:cancel:{message_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -478,7 +551,10 @@ class ActionView(discord.ui.View):
         self.owner_id = owner_id
         self.default_copies = default_copies
 
-        button = discord.ui.Button(label=label, style=style, emoji="🔁")
+        button = discord.ui.Button(
+            label=label, style=style, emoji="🔁",
+            custom_id=f"printbot:retry:{message_id}",
+        )
         button.callback = self._on_click
         self.add_item(button)
 

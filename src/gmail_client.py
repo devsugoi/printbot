@@ -21,7 +21,6 @@ from email.mime.text import MIMEText
 from email.utils import make_msgid
 import os
 
-import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -31,6 +30,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
 ]
+
+# Passed to every .execute() call. The Google API client's own retry logic
+# catches transient network errors (timeouts, connection resets) as well
+# as retryable HTTP errors (429/5xx) and retries with exponential backoff
+# -- without this, a single flaky Wi-Fi moment throws instead of retrying.
+NUM_RETRIES = 3
 
 
 @dataclass
@@ -85,12 +90,11 @@ def get_gmail_service(credentials_file: str, token_file: str):
         with open(token_file, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
 
-    http = httplib2.Http(timeout=30)
-    return build("gmail", "v1", credentials=creds, http=http)
+    return build("gmail", "v1", credentials=creds)
 
 
 def get_own_email_address(service) -> str:
-    profile = service.users().getProfile(userId="me").execute()
+    profile = service.users().getProfile(userId="me").execute(num_retries=NUM_RETRIES)
     return profile["emailAddress"].lower()
 
 
@@ -149,7 +153,7 @@ def list_candidate_message_ids(service, query: str) -> list[str]:
     message_ids = []
     request = service.users().messages().list(userId="me", q=query)
     while request is not None:
-        response = request.execute()
+        response = request.execute(num_retries=NUM_RETRIES)
         message_ids.extend(m["id"] for m in response.get("messages", []))
         request = service.users().messages().list_next(request, response)
     return message_ids
@@ -158,7 +162,7 @@ def list_candidate_message_ids(service, query: str) -> list[str]:
 def get_message(service, message_id: str) -> EmailMessage:
     raw = service.users().messages().get(
         userId="me", id=message_id, format="full"
-    ).execute()
+    ).execute(num_retries=NUM_RETRIES)
 
     payload = raw["payload"]
     headers = payload.get("headers", [])
@@ -187,7 +191,7 @@ def download_attachment(
         .messages()
         .attachments()
         .get(userId="me", messageId=message_id, id=attachment.attachment_id)
-        .execute()
+        .execute(num_retries=NUM_RETRIES)
     )
     file_bytes = base64.urlsafe_b64decode(data["data"])
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -229,9 +233,15 @@ def send_reply(
         msg.attach(part)
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    # Note: unlike the read-only calls above, retrying a send isn't
+    # perfectly safe -- if the message actually went through but the
+    # response was lost to the same kind of network hiccup, a retry could
+    # send a duplicate confirmation email. That's a minor annoyance
+    # compared to silently dropping a confirmation/result message, so it
+    # still retries here.
     service.users().messages().send(
         userId="me", body={"raw": raw, "threadId": thread_id}
-    ).execute()
+    ).execute(num_retries=NUM_RETRIES)
 
     return own_rfc_id
 
@@ -244,7 +254,7 @@ def list_new_thread_replies(
     arrived after the bot's own confirmation-ask email."""
     thread = service.users().threads().get(
         userId="me", id=thread_id, format="full"
-    ).execute()
+    ).execute(num_retries=NUM_RETRIES)
 
     replies = []
     for message in thread.get("messages", []):
