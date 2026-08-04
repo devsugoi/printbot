@@ -19,12 +19,18 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
+import http.client
+import logging
 import os
+import socket
 
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -36,6 +42,29 @@ SCOPES = [
 # as retryable HTTP errors (429/5xx) and retries with exponential backoff
 # -- without this, a single flaky Wi-Fi moment throws instead of retrying.
 NUM_RETRIES = 3
+
+# Socket timeout for httplib2. After a timeout the pooled connection is often
+# left half-closed; retries on that same connection raise CannotSendHeader.
+HTTP_TIMEOUT_SECONDS = 60
+
+# Extra reconnect attempts after the connection is known to be poisoned
+# (beyond the per-request NUM_RETRIES on a healthy connection).
+RECONNECT_ATTEMPTS = 2
+
+logger = logging.getLogger(__name__)
+
+# Errors that mean httplib2's connection pool is unusable until rebuilt.
+_POISONED_CONNECTION_ERRORS = (
+    http.client.CannotSendHeader,
+    http.client.CannotSendRequest,
+    http.client.ResponseNotReady,
+    http.client.RemoteDisconnected,
+    socket.timeout,
+    TimeoutError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
 
 
 @dataclass
@@ -65,6 +94,15 @@ class ThreadReply:
     internal_date_ms: int
 
 
+def _build_authorized_http(creds: Credentials) -> AuthorizedHttp:
+    return AuthorizedHttp(creds, http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS))
+
+
+def _attach_credentials(service, creds: Credentials):
+    """Stash OAuth creds on the discovery Resource so reconnect can rebuild HTTP."""
+    service._printbot_credentials = creds
+
+
 def get_gmail_service(credentials_file: str, token_file: str):
     """Returns an authenticated Gmail API service object, running the OAuth
     flow interactively the first time and reusing/refreshing the saved
@@ -90,11 +128,102 @@ def get_gmail_service(credentials_file: str, token_file: str):
         with open(token_file, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
 
-    return build("gmail", "v1", credentials=creds)
+    http = _build_authorized_http(creds)
+    service = build(
+        "gmail", "v1", http=http, cache_discovery=False,
+    )
+    _attach_credentials(service, creds)
+    return service
+
+
+def _close_http_connections(http_obj) -> None:
+    """Close pooled sockets on an AuthorizedHttp / httplib2.Http."""
+    underlying = getattr(http_obj, "http", http_obj)
+    connections = getattr(underlying, "connections", None)
+    if not isinstance(connections, dict):
+        return
+    for conn in list(connections.values()):
+        try:
+            conn.close()
+        except Exception:
+            pass
+    connections.clear()
+
+
+def _reconnect_http(service) -> None:
+    """Replace the service's AuthorizedHttp after a poisoned connection."""
+    creds = getattr(service, "_printbot_credentials", None)
+    if creds is None:
+        raise RuntimeError(
+            "Gmail service has no stored credentials; cannot reconnect HTTP."
+        )
+
+    old_http = getattr(service, "_http", None)
+    if old_http is not None:
+        try:
+            _close_http_connections(old_http)
+        except Exception:
+            logger.debug("Ignoring error while closing old Gmail HTTP", exc_info=True)
+
+    new_http = _build_authorized_http(creds)
+    service._http = new_http
+    logger.warning("Rebuilt Gmail HTTP connection after a poisoned/timed-out socket")
+
+
+def _is_html_bad_request(error: HttpError) -> bool:
+    """True for Google's HTML 400 page (often a mangled request on a dead conn)."""
+    if getattr(error, "resp", None) is None or error.resp.status != 400:
+        return False
+    content = error.content or b""
+    if isinstance(content, str):
+        content = content.encode("utf-8", errors="replace")
+    lowered = content[:500].lower()
+    return b"<!doctype html" in lowered or b"<html" in lowered
+
+
+def _is_poisoned_connection_error(error: BaseException) -> bool:
+    if isinstance(error, _POISONED_CONNECTION_ERRORS):
+        return True
+    if isinstance(error, HttpError) and _is_html_bad_request(error):
+        return True
+    # httplib2 sometimes wraps timeouts as SSLError with this message.
+    message = str(error).lower()
+    return "timed out" in message or "the read operation timed out" in message
+
+
+def _execute(service, request):
+    """Run request.execute with reconnect+retry when httplib2's connection dies.
+
+    googleapiclient's own num_retries handles clean transient errors. After a
+    timeout, the pooled connection is often half-closed and the next attempt
+    raises CannotSendHeader (or a mangled HTML 400). Those need a fresh Http.
+    """
+    last_error: BaseException | None = None
+
+    for attempt in range(RECONNECT_ATTEMPTS + 1):
+        try:
+            # Keep the request's http in sync with the service after reconnects.
+            request.http = service._http
+            return request.execute(num_retries=NUM_RETRIES)
+        except Exception as e:
+            last_error = e
+            if attempt >= RECONNECT_ATTEMPTS or not _is_poisoned_connection_error(e):
+                raise
+            logger.warning(
+                "Gmail request failed with poisoned connection (%s); "
+                "reconnecting (attempt %d/%d)",
+                type(e).__name__,
+                attempt + 1,
+                RECONNECT_ATTEMPTS,
+            )
+            _reconnect_http(service)
+
+    assert last_error is not None
+    raise last_error
 
 
 def get_own_email_address(service) -> str:
-    profile = service.users().getProfile(userId="me").execute(num_retries=NUM_RETRIES)
+    profile = _execute(service, service.users().getProfile(userId="me"))
     return profile["emailAddress"].lower()
 
 
@@ -153,16 +282,19 @@ def list_candidate_message_ids(service, query: str) -> list[str]:
     message_ids = []
     request = service.users().messages().list(userId="me", q=query)
     while request is not None:
-        response = request.execute(num_retries=NUM_RETRIES)
+        response = _execute(service, request)
         message_ids.extend(m["id"] for m in response.get("messages", []))
         request = service.users().messages().list_next(request, response)
     return message_ids
 
 
 def get_message(service, message_id: str) -> EmailMessage:
-    raw = service.users().messages().get(
-        userId="me", id=message_id, format="full"
-    ).execute(num_retries=NUM_RETRIES)
+    raw = _execute(
+        service,
+        service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ),
+    )
 
     payload = raw["payload"]
     headers = payload.get("headers", [])
@@ -186,12 +318,12 @@ def download_attachment(
     service, message_id: str, attachment: Attachment, dest_path: str
 ) -> str:
     """Downloads an attachment to dest_path and returns that path."""
-    data = (
+    data = _execute(
+        service,
         service.users()
         .messages()
         .attachments()
-        .get(userId="me", messageId=message_id, id=attachment.attachment_id)
-        .execute(num_retries=NUM_RETRIES)
+        .get(userId="me", messageId=message_id, id=attachment.attachment_id),
     )
     file_bytes = base64.urlsafe_b64decode(data["data"])
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -239,9 +371,12 @@ def send_reply(
     # send a duplicate confirmation email. That's a minor annoyance
     # compared to silently dropping a confirmation/result message, so it
     # still retries here.
-    service.users().messages().send(
-        userId="me", body={"raw": raw, "threadId": thread_id}
-    ).execute(num_retries=NUM_RETRIES)
+    _execute(
+        service,
+        service.users().messages().send(
+            userId="me", body={"raw": raw, "threadId": thread_id}
+        ),
+    )
 
     return own_rfc_id
 
@@ -252,9 +387,12 @@ def list_new_thread_replies(
     """Returns every message in the thread newer than
     since_internal_date_ms, oldest first. Used to detect replies that
     arrived after the bot's own confirmation-ask email."""
-    thread = service.users().threads().get(
-        userId="me", id=thread_id, format="full"
-    ).execute(num_retries=NUM_RETRIES)
+    thread = _execute(
+        service,
+        service.users().threads().get(
+            userId="me", id=thread_id, format="full"
+        ),
+    )
 
     replies = []
     for message in thread.get("messages", []):
