@@ -69,7 +69,7 @@ printbot/
 
 ```bash
 sudo apt update
-sudo apt install -y cups cups-bsd printer-driver-brlaser python3-pip python3-venv git
+sudo apt install -y cups cups-bsd python3-pip python3-venv git
 sudo apt install -y libreoffice   # converts .docx/.xlsx/... attachments to PDF for printing
 sudo usermod -aG lpadmin $USER   # then log out/in
 ```
@@ -80,16 +80,78 @@ bot converts them to PDF with `soffice --headless` first. On a
 storage-constrained Pi, `libreoffice-writer libreoffice-calc
 libreoffice-impress` covers the same formats with a smaller footprint.
 
-Install the Brother DCP-J100 driver and add the printer. Brother publishes
-Linux drivers for this model; alternatively `printer-driver-brlaser` (a
-generic open-source driver) often works fine for basic printing. Add the
-printer via the CUPS web UI (`http://<pi-ip>:631`) or:
+Install the Brother DCP-J100 driver and add the printer. **The DCP-J100
+is an inkjet — do NOT use `printer-driver-brlaser`**, which only supports
+Brother *laser* printers. With brlaser (or any wrong driver), CUPS will
+happily mark jobs "completed" while the printer sits idle and nothing
+comes out. Use Brother's official DCP-J100 LPR + cupswrapper driver
+(from Brother's Linux download page, or their `linux-brprinter-installer`
+script).
+
+**Raspberry Pi (ARM) caveat:** Brother ships the filter as an **i386**
+binary (`/opt/brother/Printers/dcpj100/lpd/brdcpj100filter`). On
+`aarch64` it fails with `Exec format error` (exit 126) unless you run it
+under qemu. Do **not** `apt install libc6:i386` on Raspberry Pi OS /
+Debian with the `+rpt1` libc — it conflicts with the Pi-patched
+`libc6:arm64`. Use the working setup below instead.
+
+#### Make the Brother i386 filter work on a Pi
 
 ```bash
-lpadmin -p Brother_DCP_J100 -E -v <device-uri> -m everywhere
-lpoptions -d Brother_DCP_J100
-lpstat -p Brother_DCP_J100         # confirm it shows up
-lpoptions -p Brother_DCP_J100 -l   # see exactly what paper sizes/media names it supports
+# 1. Emulator (arm64 package — no libc conflict)
+sudo apt-get install -y qemu-user qemu-user-binfmt
+
+# 2. Extract i386 libs into a private root (avoids multiarch conflict)
+sudo mkdir -p /var/tmp/brfix /opt/i386root
+cd /var/tmp/brfix
+sudo apt-get download gcc-13-base:i386 libc6:i386 libstdc++6:i386
+for d in gcc-13-base_*.deb libc6_*.deb libstdc++6_*.deb; do
+  sudo dpkg-deb -x "$d" /opt/i386root
+done
+
+# Debian usrmerge: qemu looks for /lib/ld-linux.so.2 under -L prefix
+sudo mkdir -p /opt/i386root/lib
+sudo ln -sfn ../usr/lib/i386-linux-gnu/ld-linux.so.2 \
+  /opt/i386root/lib/ld-linux.so.2
+
+# 3. Wrap the Brother filter so CUPS always invokes qemu
+FILTER=/opt/brother/Printers/dcpj100/lpd/brdcpj100filter
+# Only rename once — skip if .real already exists
+if [ ! -f "$FILTER.real" ]; then
+  sudo mv "$FILTER" "$FILTER.real"
+fi
+sudo tee "$FILTER" >/dev/null <<'EOF'
+#!/bin/sh
+exec /usr/bin/qemu-i386 -L /opt/i386root \
+  /opt/brother/Printers/dcpj100/lpd/brdcpj100filter.real "$@"
+EOF
+sudo chmod +x "$FILTER"
+
+# 4. Sanity check (bare invoke → "invalid option" / exit 2 is OK;
+#    exit 126 = still can't exec; ld-linux errors = -L root incomplete)
+"$FILTER"; echo exit:$?
+
+# 5. CUPS test page — must physically print
+lsusb | grep -i brother
+sudo /usr/sbin/cupsenable DCPJ100
+lp -d DCPJ100 /usr/share/cups/data/testprint
+```
+
+Keep `/opt/i386root` and the filter wrapper permanently. You can delete
+`/var/tmp/brfix` after setup. After a reboot, if printing breaks, confirm
+the wrapper and linker symlink still exist.
+
+Alternative if you have an x86 Linux box: install the Brother driver
+there, share the printer, and point the Pi's CUPS queue at that share.
+
+Add the printer via the CUPS web UI (`http://<pi-ip>:631`) or:
+
+```bash
+# Prefer the Brother DCP-J100 PPD from the official cupswrapper package,
+# not "-m everywhere", once the LPR/cupswrapper debs are installed.
+lpstat -p -d
+lpoptions -d DCPJ100
+lpoptions -p DCPJ100 -l   # paper sizes / media names your driver supports
 ```
 
 **Note:** the printer is only ever fed one of two paper choices: **short
@@ -355,6 +417,51 @@ sudo journalctl -u printbot -f     # logs
   further replies on that thread won't reopen it. If you want cancelled
   jobs to also be reprintable, add `STATUS_CANCELLED` to the retry check
   in `confirmation.ConfirmationManager.handle_approval`.
+
+## Troubleshooting
+
+### The bot says "printed successfully" but no paper comes out
+
+`lp` accepting a job only means it entered the CUPS queue. The bot now
+waits for the job to leave the queue and reports the printer state if it
+gets stuck, but a job that "completes" with no output almost always means
+the wrong driver is installed **or the Brother i386 filter can't run on
+ARM** (see setup step 1 — `brlaser` does NOT support the DCP-J100 inkjet;
+on a Pi, missing qemu wrapping causes silent "completed" jobs). Diagnose:
+
+```bash
+lpstat -v DCPJ100                      # which device URI the queue points at
+lpstat -p DCPJ100 -l                   # printer state + last state message
+lsusb | grep -i brother                # must show the printer when powered on
+file /opt/brother/Printers/dcpj100/lpd/brdcpj100filter.real 2>/dev/null \
+  || file /opt/brother/Printers/dcpj100/lpd/brdcpj100filter
+# Expect: ELF 32-bit LSB executable, Intel i386
+/opt/brother/Printers/dcpj100/lpd/brdcpj100filter; echo exit:$?
+# exit 126 = Exec format error → install qemu wrap (setup step 1)
+# "invalid option" / exit 2 = filter runs (qemu OK); try a real lp job
+lp -d DCPJ100 /usr/share/cups/data/testprint
+lpstat -W completed -o DCPJ100
+sudo tail -50 /var/log/cups/error_log
+```
+
+If the test page "completes" without printing and `file` shows an i386
+binary that exits 126, redo the qemu + `/opt/i386root` wrap in setup
+step 1. If USB shows "Unplugged or turned off", power/cable first —
+CUPS will disable the queue until the printer reappears
+(`cupsenable DCPJ100`).
+
+### Duplicate jobs for the same email thread / repeated approvals
+
+Older versions could create a second job when a reply in the thread
+carried the original attachment, and the two jobs could then approve
+each other in a loop via the bot's own notification emails. This is
+fixed (bot emails are tagged with an `X-Printbot` header and ignored;
+one job per Gmail thread is enforced; quoted text is stripped before
+reply classification), and duplicate jobs already in `state.json` are
+skipped by the reply poller with a warning. To clean up for good: stop
+the bot, open `state.json`, delete the newer duplicate entries under
+`"jobs"` (the ones whose subject starts with `Re:`), and start the bot
+again.
 
 ## Recommendations
 

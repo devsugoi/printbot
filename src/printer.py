@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
+import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,14 @@ _UNAVAILABLE_MARKERS = (
     "offline",
     "paused",
 )
+
+# `lp` success output looks like: 'request id is DCPJ100-42 (1 file(s))'
+_LP_REQUEST_ID_RE = re.compile(r"request id is (\S+-\d+)")
+
+# How long to wait for a submitted job to leave the CUPS queue before
+# concluding it is stuck, and how often to check.
+JOB_COMPLETION_TIMEOUT_SECONDS = 30
+JOB_POLL_INTERVAL_SECONDS = 2
 
 
 @dataclass
@@ -100,6 +110,67 @@ def is_printer_available(printer_name: str) -> bool:
     return check_printer_availability(printer_name).available
 
 
+def _printer_state_message(printer_name: str) -> str:
+    """Returns the long-form `lpstat -p <printer> -l` output, which includes
+    the printer-state-message CUPS records when a job gets stuck."""
+    try:
+        result = subprocess.run(
+            ["lpstat", "-p", printer_name, "-l"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        return f"(could not read printer state: {e})"
+    return (result.stdout or "").strip() or (result.stderr or "").strip()
+
+
+def wait_for_job(
+    printer_name: str,
+    job_id: str,
+    timeout: float = JOB_COMPLETION_TIMEOUT_SECONDS,
+) -> PrintResult:
+    """Waits for a submitted CUPS job to leave the not-completed queue.
+
+    `lp` exiting 0 only means the job was queued; a broken driver/filter
+    or a held queue can leave it stuck (or silently eat it) while the bot
+    would otherwise report success. This polls `lpstat -W not-completed`
+    until the job disappears from the queue or the timeout elapses.
+    """
+    deadline = time.monotonic() + timeout
+
+    while True:
+        try:
+            result = subprocess.run(
+                ["lpstat", "-W", "not-completed", "-o", printer_name],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            logger.error("Could not check status of job %s: %s", job_id, e)
+            # Can't verify -- report the submission as-is rather than
+            # failing a job that may well be printing.
+            return PrintResult(
+                True, f"Job {job_id} was queued (status check unavailable: {e})."
+            )
+
+        pending = result.stdout or ""
+        if job_id not in pending:
+            logger.info("CUPS reports job %s completed.", job_id)
+            return PrintResult(True, f"CUPS reports job {job_id} completed.")
+
+        if time.monotonic() >= deadline:
+            state = _printer_state_message(printer_name)
+            logger.error(
+                "Job %s still in the CUPS queue after %.0fs. Printer state: %s",
+                job_id, timeout, state,
+            )
+            return PrintResult(
+                False,
+                f"Job {job_id} was queued but hasn't printed after "
+                f"{timeout:.0f}s. Printer state: {state}",
+            )
+
+        time.sleep(JOB_POLL_INTERVAL_SECONDS)
+
+
 def print_file(filepath: str, paper_size: str, printer_name: str, copies: int = 1) -> PrintResult:
     media = CUPS_MEDIA_NAMES.get(paper_size, paper_size)
     copies = max(1, int(copies))
@@ -149,12 +220,18 @@ def print_file(filepath: str, paper_size: str, printer_name: str, copies: int = 
     )
 
     if result.returncode == 0:
-        message = stdout or "Sent to printer."
         logger.info(
             "CUPS accepted print job for %s (%s): %s",
-            abs_path, printer_name, message,
+            abs_path, printer_name, stdout or "Sent to printer.",
         )
-        return PrintResult(True, message)
+        match = _LP_REQUEST_ID_RE.search(stdout)
+        if match is None:
+            logger.warning(
+                "Could not parse a CUPS job id from lp output %r; "
+                "skipping completion check.", stdout,
+            )
+            return PrintResult(True, stdout or "Sent to printer.")
+        return wait_for_job(printer_name, match.group(1))
 
     error_message = stderr or stdout or "Unknown error"
     logger.error(

@@ -191,6 +191,21 @@ class StateStore:
         with self._lock:
             return [_job_from_dict(raw) for raw in self._data["jobs"].values()]
 
+    def find_job_by_thread(self, thread_id: str) -> Optional[PrintJob]:
+        """Returns the earliest-created job for a Gmail thread, if any.
+        Used to guarantee at most one job per thread -- later messages in
+        the thread (replies, the bot's own notifications) must never spawn
+        duplicate jobs that would then approve each other."""
+        with self._lock:
+            matches = [
+                _job_from_dict(raw)
+                for raw in self._data["jobs"].values()
+                if raw.get("thread_id") == thread_id
+            ]
+        if not matches:
+            return None
+        return min(matches, key=lambda j: j.created_at)
+
     def jobs_awaiting_email_replies(self, retention_days: int) -> list[PrintJob]:
         """Jobs whose email thread is still worth polling for new replies:
         anything reprintable, and not older than the configured retention

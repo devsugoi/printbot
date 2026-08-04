@@ -241,6 +241,20 @@ class PrintBot(commands.Bot):
         if not email.attachments:
             return
 
+        existing = self.state.find_job_by_thread(email.thread_id)
+        if existing is not None:
+            # A job already exists for this Gmail thread. Later messages
+            # in the thread (human replies quoting the attachment, or the
+            # bot's own preview emails) must not become duplicate jobs --
+            # that's what caused jobs to approve each other in a loop.
+            # Replies are handled by poll_email_replies instead.
+            logger.info(
+                "Skipping candidate %s: thread %s already has job %s (%r)",
+                message_id, email.thread_id, existing.message_id,
+                existing.subject,
+            )
+            return
+
         try:
             result = await asyncio.to_thread(
                 self.classifier.classify,
@@ -423,6 +437,27 @@ class PrintBot(commands.Bot):
             self.app_config.storage.processed_email_retention_days
         )
 
+        # Safety net for state written before the one-job-per-thread
+        # guard existed: if several jobs share a thread, only the
+        # original (earliest) one may react to replies, otherwise a
+        # single "yes" would print every duplicate.
+        earliest_per_thread: dict[str, PrintJob] = {}
+        for job in jobs:
+            kept = earliest_per_thread.get(job.thread_id)
+            if kept is None or job.created_at < kept.created_at:
+                earliest_per_thread[job.thread_id] = job
+        if len(earliest_per_thread) < len(jobs):
+            skipped = [
+                j.message_id for j in jobs
+                if earliest_per_thread[j.thread_id].message_id != j.message_id
+            ]
+            logger.warning(
+                "Skipping duplicate job(s) sharing a thread with an earlier "
+                "job: %s -- consider removing them from state.json",
+                ", ".join(skipped),
+            )
+        jobs = list(earliest_per_thread.values())
+
         for job in jobs:
             try:
                 replies = await asyncio.to_thread(
@@ -455,9 +490,25 @@ class PrintBot(commands.Bot):
                     )
                     continue
 
+                # Classify only the fresh text the human wrote -- quoted
+                # history repeats the bot's own phrasing ("print again",
+                # "printing 1 copy now") and must not count as intent.
+                fresh_text = gmail_client.strip_quoted_text(reply.body_text)
+                if not fresh_text:
+                    logger.info(
+                        "Ignoring reply on job %s with no new text after "
+                        "removing quoted history", job.message_id,
+                    )
+                    # Still advance the watermark so this reply isn't
+                    # re-examined every poll.
+                    self.state.update_last_seen_internal_date(
+                        job.message_id, reply.internal_date_ms
+                    )
+                    continue
+
                 try:
                     decision = await asyncio.to_thread(
-                        self.classifier.classify_reply, reply.body_text
+                        self.classifier.classify_reply, fresh_text
                     )
                 except AllKeysExhaustedError as e:
                     logger.error(

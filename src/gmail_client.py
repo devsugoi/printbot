@@ -56,6 +56,13 @@ RECONNECT_ATTEMPTS = 2
 
 logger = logging.getLogger(__name__)
 
+# Header stamped on every email the bot sends. Reply polling skips
+# messages carrying it, so the bot's own notifications (which can contain
+# phrases like "print again") are never fed to the reply classifier and
+# can never approve a job. Without this, two jobs sharing one thread can
+# approve each other in an infinite loop.
+PRINTBOT_HEADER = "X-Printbot"
+
 # httplib2 is not thread-safe. Discord runs poll_gmail and poll_email_replies
 # concurrently via asyncio.to_thread on one shared service -- serialize all
 # HTTP use (including reconnect) so one thread cannot close sockets another
@@ -392,6 +399,7 @@ def send_reply(
     msg = MIMEMultipart()
     msg["To"] = to_address
     msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    msg[PRINTBOT_HEADER] = "1"
     own_rfc_id = make_msgid()
     msg["Message-Id"] = own_rfc_id
     if in_reply_to_rfc_id:
@@ -455,9 +463,39 @@ def list_new_thread_replies(
         if internal_date <= since_internal_date_ms:
             continue
         headers = message["payload"].get("headers", [])
+        if _header(headers, PRINTBOT_HEADER):
+            # One of the bot's own notification emails -- never treat it
+            # as a human reply (see PRINTBOT_HEADER above).
+            continue
         from_address = _extract_email_address(_header(headers, "From"))
         body_text = _extract_body_text(message["payload"])
         replies.append(ThreadReply(from_address, body_text, internal_date))
 
     replies.sort(key=lambda r: r.internal_date_ms)
     return replies
+
+
+_QUOTE_INTRO_MARKERS = ("wrote:", "napisal:", "schrieb:")
+
+
+def strip_quoted_text(body_text: str) -> str:
+    """Removes quoted history from a reply body: '>'-prefixed lines, and
+    everything from an 'On <date>, <someone> wrote:' intro line onward.
+    Quoted history often contains the bot's own phrases ('print again',
+    'printing 1 copy now'), which must not reach the reply classifier."""
+    kept: list[str] = []
+    for line in body_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            continue
+        lowered = stripped.lower()
+        if (
+            lowered.startswith("on ")
+            and any(lowered.endswith(m) for m in _QUOTE_INTRO_MARKERS)
+        ):
+            # Everything below the "On ... wrote:" line is quoted history.
+            break
+        if lowered.startswith("-----original message-----"):
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
