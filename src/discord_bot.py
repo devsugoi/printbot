@@ -33,6 +33,7 @@ from .state import (
     STATUS_PRINTING,
     PrintFile,
     PrintJob,
+    PrintOptions,
     StateStore,
 )
 
@@ -133,17 +134,23 @@ class PrintBot(commands.Bot):
             if job.status == STATUS_AWAITING_CONFIRMATION:
                 self.add_view(ConfirmView(
                     self.confirmation, job.message_id, owner_id,
+                    self.classifier,
+                    self.app_config.printer.supported_paper_sizes,
                     **self._confirm_view_kwargs(job),
                 ))
             elif job.status == STATUS_PRINTED:
                 self.add_view(ActionView(
                     self.confirmation, job.message_id, owner_id,
+                    self.classifier,
+                    self.app_config.printer.supported_paper_sizes,
                     label="Print again", style=discord.ButtonStyle.primary,
                     default_copies=job.copies,
                 ))
             elif job.status == STATUS_FAILED:
                 self.add_view(ActionView(
                     self.confirmation, job.message_id, owner_id,
+                    self.classifier,
+                    self.app_config.printer.supported_paper_sizes,
                     label="Reprint", style=discord.ButtonStyle.danger,
                     default_copies=job.copies,
                 ))
@@ -400,7 +407,9 @@ class PrintBot(commands.Bot):
             f"I think this email is asking to print the attached file(s): "
             f"{file_list}.\n\n"
             f'Reply to this thread with something like "yes, 2 copies" to '
-            f'confirm, or "no" to cancel. You can also confirm on Discord.'
+            f'confirm, or "no" to cancel. You can add extra instructions, '
+            f'e.g. "yes, page 2 only" or "yes, use A4". You can also confirm '
+            f"on Discord."
             + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
             + (f"\n\n{warning}" if warning else "")
         )
@@ -566,7 +575,9 @@ class PrintBot(commands.Bot):
 
                 try:
                     decision = await asyncio.to_thread(
-                        self.classifier.classify_reply, fresh_text
+                        self.classifier.classify_reply,
+                        fresh_text,
+                        self.app_config.printer.supported_paper_sizes,
                     )
                 except AllKeysExhaustedError as e:
                     logger.error(
@@ -591,11 +602,16 @@ class PrintBot(commands.Bot):
                 is_explicit_retry = current.status != STATUS_AWAITING_CONFIRMATION
 
                 if decision.decision == "approve":
+                    approval_options = PrintOptions(
+                        page_ranges=decision.page_ranges,
+                        paper_size_override=decision.paper_size_override,
+                    )
                     await self.confirmation.handle_approval(
                         job.message_id, source="email",
                         actor=reply.from_address, copies=decision.copies,
                         is_explicit_retry=is_explicit_retry,
                         fit_long_on_short=decision.fit_on_short,
+                        approval_options=approval_options,
                     )
                 elif decision.decision == "cancel":
                     await self.confirmation.handle_cancel(
@@ -632,17 +648,23 @@ class PrintBot(commands.Bot):
         if job.status == STATUS_AWAITING_CONFIRMATION:
             view = ConfirmView(
                 self.confirmation, job.message_id, owner_id,
+                self.classifier,
+                self.app_config.printer.supported_paper_sizes,
                 **self._confirm_view_kwargs(job),
             )
         elif job.status == STATUS_PRINTED:
             view = ActionView(
                 self.confirmation, job.message_id, owner_id,
+                self.classifier,
+                self.app_config.printer.supported_paper_sizes,
                 label="Print again", style=discord.ButtonStyle.primary,
                 default_copies=job.copies,
             )
         elif job.status == STATUS_FAILED:
             view = ActionView(
                 self.confirmation, job.message_id, owner_id,
+                self.classifier,
+                self.app_config.printer.supported_paper_sizes,
                 label="Reprint", style=discord.ButtonStyle.danger,
                 default_copies=job.copies,
             )
@@ -695,20 +717,21 @@ class PrintBot(commands.Bot):
                 )
 
 
-class CopiesModal(discord.ui.Modal):
-    """Pops up when Print / Print again / Reprint is clicked, asking how
-    many copies. Leaving it blank keeps the previous count (or defaults to
-    1 for a brand new job)."""
+class ApprovalModal(discord.ui.Modal):
+    """Pops up when Print / Print again / Reprint is clicked."""
 
     def __init__(
         self, confirmation: ConfirmationManager, message_id: str,
+        classifier: GeminiClassifier, supported_paper_sizes: list[str],
         default_copies: int = 1, is_explicit_retry: bool = False,
         fit_long_on_short: bool = False,
-        title: str = "How many copies?",
+        title: str = "Print options",
     ):
         super().__init__(title=title)
         self.confirmation = confirmation
         self.message_id = message_id
+        self.classifier = classifier
+        self.supported_paper_sizes = supported_paper_sizes
         self.is_explicit_retry = is_explicit_retry
         self.fit_long_on_short = fit_long_on_short
         self.copies_input = discord.ui.TextInput(
@@ -717,11 +740,38 @@ class CopiesModal(discord.ui.Modal):
             required=False,
             max_length=3,
         )
+        self.extras_input = discord.ui.TextInput(
+            label="Extra instructions (optional)",
+            placeholder="e.g. page 2 only, use A4",
+            required=False,
+            max_length=500,
+            style=discord.TextStyle.paragraph,
+        )
         self.add_item(self.copies_input)
+        self.add_item(self.extras_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = (self.copies_input.value or "").strip()
         copies = int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+        extras_text = (self.extras_input.value or "").strip()
+        approval_options = None
+        if extras_text:
+            try:
+                parsed = await asyncio.to_thread(
+                    self.classifier.parse_approval_extras,
+                    extras_text,
+                    self.supported_paper_sizes,
+                )
+                approval_options = parsed.options
+                if copies is None and parsed.copies is not None:
+                    copies = parsed.copies
+            except AllKeysExhaustedError as e:
+                await interaction.response.send_message(
+                    f"Could not parse extra instructions: {e}",
+                    ephemeral=True,
+                )
+                return
 
         await interaction.response.send_message(
             "Got it — working on it now.", ephemeral=True
@@ -730,19 +780,28 @@ class CopiesModal(discord.ui.Modal):
             self.message_id, source="discord", actor=str(interaction.user),
             copies=copies, is_explicit_retry=self.is_explicit_retry,
             fit_long_on_short=self.fit_long_on_short,
+            approval_options=approval_options,
         )
+
+
+# Backwards-compatible alias for any external references.
+CopiesModal = ApprovalModal
 
 
 class ConfirmView(discord.ui.View):
     def __init__(
         self, confirmation: ConfirmationManager, message_id: str,
-        owner_id: int, has_long_paper: bool = False,
+        owner_id: int, classifier: GeminiClassifier,
+        supported_paper_sizes: list[str],
+        has_long_paper: bool = False,
         aspose_available: bool = False, cloudmersive_available: bool = False,
     ):
         super().__init__(timeout=None)
         self.confirmation = confirmation
         self.message_id = message_id
         self.owner_id = owner_id
+        self.classifier = classifier
+        self.supported_paper_sizes = supported_paper_sizes
 
         print_btn = discord.ui.Button(
             label="Print", style=discord.ButtonStyle.success, emoji="🖨️",
@@ -796,13 +855,17 @@ class ConfirmView(discord.ui.View):
 
     async def _on_print(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            CopiesModal(self.confirmation, self.message_id)
+            ApprovalModal(
+                self.confirmation, self.message_id,
+                self.classifier, self.supported_paper_sizes,
+            )
         )
 
     async def _on_print_short(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            CopiesModal(
+            ApprovalModal(
                 self.confirmation, self.message_id,
+                self.classifier, self.supported_paper_sizes,
                 fit_long_on_short=True,
                 title="Print on short bond (scaled to fit)",
             )
@@ -840,12 +903,15 @@ class ActionView(discord.ui.View):
 
     def __init__(
         self, confirmation: ConfirmationManager, message_id: str, owner_id: int,
+        classifier: GeminiClassifier, supported_paper_sizes: list[str],
         label: str, style: discord.ButtonStyle, default_copies: int = 1,
     ):
         super().__init__(timeout=None)
         self.confirmation = confirmation
         self.message_id = message_id
         self.owner_id = owner_id
+        self.classifier = classifier
+        self.supported_paper_sizes = supported_paper_sizes
         self.default_copies = default_copies
 
         button = discord.ui.Button(
@@ -865,8 +931,9 @@ class ActionView(discord.ui.View):
 
     async def _on_click(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            CopiesModal(
+            ApprovalModal(
                 self.confirmation, self.message_id,
+                self.classifier, self.supported_paper_sizes,
                 default_copies=self.default_copies, is_explicit_retry=True,
             )
         )

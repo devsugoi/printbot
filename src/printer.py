@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 CUPS_MEDIA_NAMES = {
     "Short": "Letter",
     "Long": "Legal",
+    "A4": "A4",
 }
 
 # Substrings in `lpstat -p` output that mean the queue exists but is not
@@ -172,14 +173,21 @@ def wait_for_job(
         time.sleep(JOB_POLL_INTERVAL_SECONDS)
 
 
-def print_file(filepath: str, paper_size: str, printer_name: str, copies: int = 1) -> PrintResult:
+def print_file(
+    filepath: str,
+    paper_size: str,
+    printer_name: str,
+    copies: int = 1,
+    page_ranges: str | None = None,
+) -> PrintResult:
     media = CUPS_MEDIA_NAMES.get(paper_size, paper_size)
     copies = max(1, int(copies))
     abs_path = os.path.abspath(filepath)
 
     logger.info(
-        "Preparing print: printer=%s paper_size=%s media=%s copies=%d file=%s",
-        printer_name, paper_size, media, copies, abs_path,
+        "Preparing print: printer=%s paper_size=%s media=%s copies=%d "
+        "page_ranges=%s file=%s",
+        printer_name, paper_size, media, copies, page_ranges, abs_path,
     )
 
     if not os.path.exists(abs_path):
@@ -197,8 +205,10 @@ def print_file(filepath: str, paper_size: str, printer_name: str, copies: int = 
         "-o", f"media={media}",
         "-o", "fit-to-page",
         "-n", str(copies),
-        abs_path,
     ]
+    if page_ranges:
+        command.extend(["-o", f"page-ranges={page_ranges}"])
+    command.append(abs_path)
     logger.info("Running print command: %s", command)
 
     try:

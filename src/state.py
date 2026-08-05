@@ -36,6 +36,13 @@ REPRINTABLE_STATUSES = (STATUS_AWAITING_CONFIRMATION, STATUS_PRINTED, STATUS_FAI
 
 
 @dataclass
+class PrintOptions:
+    """Optional print instructions set at approval time (email or Discord)."""
+    page_ranges: Optional[str] = None       # CUPS format: "2", "1-3", "1,3-5"
+    paper_size_override: Optional[str] = None  # canonical name, e.g. "A4", "Short"
+
+
+@dataclass
 class PrintFile:
     path: str
     paper_size: str            # "Short" or "Long"
@@ -67,6 +74,7 @@ class PrintJob:
     last_error: Optional[str] = None
     attempts: int = 0
     fit_long_on_short: bool = False  # scale Long content onto Short paper
+    approval_options: PrintOptions = field(default_factory=PrintOptions)
 
     def paper_size_groups(self) -> list[tuple[str, list[PrintFile]]]:
         """Groups files by paper size, preserving first-seen order. Most
@@ -103,6 +111,9 @@ def _job_to_dict(job: PrintJob) -> dict:
 def _job_from_dict(raw: dict) -> PrintJob:
     raw = dict(raw)
     raw["files"] = [PrintFile(**f) for f in raw.get("files", [])]
+    opts = raw.get("approval_options") or {}
+    if isinstance(opts, dict):
+        raw["approval_options"] = PrintOptions(**opts)
     filtered = {k: v for k, v in raw.items() if k in _PRINT_JOB_FIELDS}
     return PrintJob(**filtered)
 

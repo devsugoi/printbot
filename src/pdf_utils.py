@@ -9,6 +9,7 @@ size detection via detect_pdf_paper_size / the AI classifier.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,7 @@ import requests
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.lib.utils import ImageReader
+from reportlab.lib.pagesizes import A4 as A4_PAGESIZE
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
@@ -37,13 +39,70 @@ _CLOUD_BACKENDS = {BACKEND_ASPOSE, BACKEND_CLOUDMERSIVE}
 PAPER_SIZES: dict[str, tuple[float, float]] = {
     "Short": (8.5 * inch, 11 * inch),
     "Long": (8.5 * inch, 14 * inch),
+    "A4": A4_PAGESIZE,
 }
 
 # Human-friendly labels shown in Discord messages / logs.
 PAPER_SIZE_LABELS: dict[str, str] = {
     "Short": "Short bond paper (8.5\" x 11\")",
     "Long": "Long bond paper (8.5\" x 14\")",
+    "A4": "A4 paper (210 x 297 mm)",
 }
+
+# Natural-language aliases -> canonical paper size names.
+_PAPER_SIZE_ALIASES: dict[str, str] = {
+    "short": "Short",
+    "short bond": "Short",
+    "short bond paper": "Short",
+    "letter": "Short",
+    "letter size": "Short",
+    "us letter": "Short",
+    "8.5x11": "Short",
+    "long": "Long",
+    "long bond": "Long",
+    "long bond paper": "Long",
+    "legal": "Long",
+    "legal size": "Long",
+    "us legal": "Long",
+    "folio": "Long",
+    "8.5x14": "Long",
+    "a4": "A4",
+    "a4 paper": "A4",
+    "a4 size": "A4",
+}
+
+
+def normalize_paper_size_name(
+    name: str | None, supported: list[str],
+) -> str | None:
+    """Map a canonical or natural-language paper size to a supported name."""
+    if not name or not supported:
+        return None
+    supported_map = {s.lower(): s for s in supported}
+    stripped = name.strip()
+    if not stripped:
+        return None
+    if stripped in supported:
+        return stripped
+    lower = stripped.lower()
+    if lower in supported_map:
+        return supported_map[lower]
+    alias = _PAPER_SIZE_ALIASES.get(lower)
+    if alias and alias in supported:
+        return alias
+    return None
+
+
+def normalize_page_ranges(value: str | None) -> str | None:
+    """Validate and normalize a CUPS page-ranges string."""
+    if not value:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if re.match(r"^\d+(-\d+)?(,\d+(-\d+)?)*$", stripped):
+        return stripped
+    return None
 
 
 def resolve_paper_size(name: str | None, default: str) -> tuple[str, tuple[float, float]]:

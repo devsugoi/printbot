@@ -485,11 +485,22 @@ sudo journalctl -u printbot -f     # logs
 - You get a Discord message with **Print** / **Cancel** buttons (plus
   **Print on short bond** when long paper is needed, and **Reconvert**
   buttons when cloud providers are configured), and a reply in the email
-  thread with the same information. Clicking **Print** (or replying
-  "yes") opens/asks for **how many copies** — leave it blank to default to
-  1.
+  thread with the same information. Clicking **Print** opens a modal for
+  **copies** and optional **extra instructions** (e.g. `page 2 only`,
+  `use A4`). Replying by email can include the same extras in one message.
+- **Approval-time print options** (optional, both channels):
+  - **Page range** — e.g. `yes, 1 copy, page 2 only` or `pages 1-3`.
+    Applies to every PDF in the job (multi-attachment jobs use the same
+    range on each file). Passed to CUPS as `page-ranges=`.
+  - **Paper size override** — e.g. `yes, use A4` or `print on long bond`.
+    Must be listed in `printer.supported_paper_sizes` in `config.yaml`.
+    PDFs are scaled to fit the requested size before printing. When set,
+    tray-swap pauses are skipped (all files print on that media).
+  - Natural language is interpreted by Gemini; unsupported sizes are
+    rejected with an error on both channels.
 - Whichever channel you respond on first is honored; both channels then
-  get an "approved via X — printing N copies" notice.
+  get an "approved via X — printing N copies" notice (including any
+  page/size options).
 - If printing fails (including if the printer isn't detected at all), you
   get the specific error on **both** channels plus a **Reprint** button;
   replying to the email also retries.
@@ -512,13 +523,12 @@ sudo journalctl -u printbot -f     # logs
 - **Search query**: tighten `gmail.search_query` (e.g. add
   `from:family@example.com`) to reduce how much gets sent to Gemini and
   avoid burning through free-tier quota on irrelevant mail.
-- **Paper sizes**: the bot is intentionally locked to two choices (short
-  bond paper / long bond paper) to match a printer loaded with only those
-  two trays/stacks. Generated (image-combined) PDFs are always short bond
-  paper by design. If you ever need more paper options, add entries to
-  `printer.supported_paper_sizes`, `pdf_utils.PAPER_SIZES` /
-  `PAPER_SIZE_LABELS`, and `printer.CUPS_MEDIA_NAMES` together, and update
-  the allowed values in `ai_classifier.CLASSIFY_PROMPT_TEMPLATE`.
+- **Paper sizes**: default setup uses short and long bond paper. You can
+  add more sizes (e.g. `A4`) to `printer.supported_paper_sizes` in
+  `config.yaml` if your driver supports them (`lpoptions -p <printer> -l`).
+  Built-in mappings live in `pdf_utils.PAPER_SIZES` /
+  `PAPER_SIZE_LABELS` and `printer.CUPS_MEDIA_NAMES`. Users can override
+  the detected size at approval time via email or Discord (see Usage).
 - **Multiple attachments to print selectively**: currently the bot prints
   *all* attachments on a matched email. If you want Gemini to pick specific
   files, extend the JSON schema in `ai_classifier.CLASSIFY_PROMPT_TEMPLATE`

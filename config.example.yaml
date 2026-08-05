@@ -58,11 +58,13 @@ printer:
   name: "Brother_DCP_J100"
   # The printer is only ever loaded with two paper choices. "Short" = short
   # bond paper (8.5x11in / Letter), "Long" = long bond paper (8.5x14in /
-  # Legal). Used when the bot can't confidently decide which one to use.
+  # Legal), "A4" = ISO A4 (210x297mm). Add any sizes your printer/driver
+  # supports (check with `lpoptions -p <printer> -l`).
   default_paper_size: "Short"
   supported_paper_sizes:
     - "Short"
     - "Long"
+    # - "A4"   # uncomment if you load A4 paper and your driver supports it
 
 storage:
   jobs_dir: "jobs"                  # downloaded attachments + generated PDFs

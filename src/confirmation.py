@@ -35,6 +35,7 @@ from .state import (
     STATUS_PRINTING,
     PrintFile,
     PrintJob,
+    PrintOptions,
     StateStore,
 )
 
@@ -66,6 +67,7 @@ class ConfirmationManager:
         copies: Optional[int] = None,
         is_explicit_retry: bool = False,
         fit_long_on_short: Optional[bool] = None,
+        approval_options: Optional[PrintOptions] = None,
     ) -> bool:
         """source is "discord" or "email"; actor is a user tag or email
         address, shown in the "approved via" notification.
@@ -101,6 +103,20 @@ class ConfirmationManager:
                 # A full "print again" after a previous success starts over.
                 job.current_group_index = 0
 
+            if approval_options is not None:
+                job.approval_options = approval_options
+            elif currently_awaiting:
+                job.approval_options = PrintOptions()
+
+            validation_error = self._validate_approval_options(job)
+            if validation_error:
+                await self.notify_both(
+                    job,
+                    discord_text=f"❌ Cannot print: {validation_error}",
+                    email_text=f"Cannot print: {validation_error}",
+                )
+                return False
+
             job.copies = copies if copies is not None else (job.copies or 1)
             if fit_long_on_short is not None:
                 job.fit_long_on_short = fit_long_on_short
@@ -114,18 +130,19 @@ class ConfirmationManager:
             plural = "y" if job.copies == 1 else "ies"
             mode_note = (
                 " on short bond paper (scaled to fit)"
-                if job.fit_long_on_short
+                if job.fit_long_on_short and not job.approval_options.paper_size_override
                 else ""
             )
+            options_note = self._format_approval_options_note(job)
             await self.notify_both(
                 job,
                 discord_text=(
                     f"✅ Approved via {source} ({actor}) — printing "
-                    f"{job.copies} cop{plural}{mode_note}."
+                    f"{job.copies} cop{plural}{mode_note}{options_note}."
                 ),
                 email_text=(
                     f"Approved via {source} ({actor}). Printing "
-                    f"{job.copies} cop{plural}{mode_note} now."
+                    f"{job.copies} cop{plural}{mode_note}{options_note} now."
                 ),
             )
 
@@ -255,8 +272,10 @@ class ConfirmationManager:
 
         logger.info(
             "Starting print for job %s subject=%r copies=%d fit_long_on_short=%s "
-            "files=%d group_index=%d",
+            "page_ranges=%s paper_override=%s files=%d group_index=%d",
             job.message_id, job.subject, job.copies, job.fit_long_on_short,
+            job.approval_options.page_ranges,
+            job.approval_options.paper_size_override,
             len(job.files), job.current_group_index,
         )
 
@@ -332,6 +351,7 @@ class ConfirmationManager:
                     printer.print_file,
                     print_path, effective_size,
                     self.app_config.printer.name, job.copies,
+                    page_ranges=job.approval_options.page_ranges,
                 )
                 if not result.success:
                     logger.error(
@@ -351,6 +371,7 @@ class ConfirmationManager:
             if (
                 job.current_group_index < len(groups)
                 and not job.fit_long_on_short
+                and not job.approval_options.paper_size_override
             ):
                 # More paper-size groups remain -- pause for a tray swap
                 # and re-enter the confirmation flow for the next group.
@@ -386,6 +407,7 @@ class ConfirmationManager:
         job.status = STATUS_PRINTED
         self.state.save_job(job)
         plural = "y" if job.copies == 1 else "ies"
+        options_note = self._format_approval_options_note(job)
         logger.info(
             "Job %s marked printed (CUPS accepted all files; copies=%d). "
             "Physical output is not verified — check the printer / "
@@ -396,11 +418,11 @@ class ConfirmationManager:
             job,
             discord_text=(
                 f"✅ Printed **{job.subject}** successfully "
-                f"({job.copies} cop{plural})."
+                f"({job.copies} cop{plural}{options_note})."
             ),
             email_text=(
-                f"Printed successfully ({job.copies} cop{plural}). Reply "
-                f'"print again" any time to print another copy.'
+                f"Printed successfully ({job.copies} cop{plural}{options_note}). "
+                f'Reply "print again" any time to print another copy.'
             ),
         )
 
@@ -430,20 +452,76 @@ class ConfirmationManager:
             path = converted
 
         effective_size = f.paper_size
-        if job.fit_long_on_short and f.paper_size == "Long":
+        override = job.approval_options.paper_size_override
+        if (
+            job.fit_long_on_short
+            and f.paper_size == "Long"
+            and not override
+        ):
             effective_size = "Short"
             if pdf_utils.is_pdf_file(path):
                 if f.scaled_path and os.path.exists(f.scaled_path):
-                    return f.scaled_path, effective_size
-                output_path = pdf_utils.scaled_pdf_path(path, "Short")
-                await asyncio.to_thread(
-                    pdf_utils.scale_pdf_to_paper_size,
-                    path, output_path, "Short",
-                )
-                f.scaled_path = output_path
-                self.state.save_job(job)
-                return output_path, effective_size
+                    path = f.scaled_path
+                else:
+                    output_path = pdf_utils.scaled_pdf_path(path, "Short")
+                    await asyncio.to_thread(
+                        pdf_utils.scale_pdf_to_paper_size,
+                        path, output_path, "Short",
+                    )
+                    f.scaled_path = output_path
+                    self.state.save_job(job)
+                    path = output_path
+
+        if override:
+            effective_size = override
+            if pdf_utils.is_pdf_file(path) and override != f.paper_size:
+                output_path = pdf_utils.scaled_pdf_path(path, override)
+                if os.path.exists(output_path):
+                    path = output_path
+                else:
+                    await asyncio.to_thread(
+                        pdf_utils.scale_pdf_to_paper_size,
+                        path, output_path, override,
+                    )
+                    f.scaled_path = output_path
+                    self.state.save_job(job)
+                    path = output_path
+
         return path, effective_size
+
+    def _validate_approval_options(self, job: PrintJob) -> Optional[str]:
+        opts = job.approval_options
+        supported = self.app_config.printer.supported_paper_sizes
+        if opts.paper_size_override:
+            if opts.paper_size_override not in supported:
+                allowed = ", ".join(supported) or "(none configured)"
+                return (
+                    f"Paper size '{opts.paper_size_override}' is not supported. "
+                    f"Allowed sizes: {allowed}."
+                )
+        if opts.page_ranges and not pdf_utils.normalize_page_ranges(
+            opts.page_ranges
+        ):
+            return (
+                f"Invalid page range '{opts.page_ranges}'. "
+                f"Use CUPS format like '2', '1-3', or '1,3-5'."
+            )
+        return None
+
+    @staticmethod
+    def _format_approval_options_note(job: PrintJob) -> str:
+        parts = []
+        opts = job.approval_options
+        if opts.page_ranges:
+            parts.append(f"pages {opts.page_ranges}")
+        if opts.paper_size_override:
+            label = pdf_utils.PAPER_SIZE_LABELS.get(
+                opts.paper_size_override, opts.paper_size_override,
+            )
+            parts.append(label)
+        if not parts:
+            return ""
+        return ", " + ", ".join(parts)
 
     async def _fail_job(self, job: PrintJob, error_message: str, group_index: Optional[int] = None):
         if group_index is not None:

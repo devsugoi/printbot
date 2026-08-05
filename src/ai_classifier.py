@@ -23,11 +23,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from google import genai
 from google.genai import errors
+
+from . import pdf_utils
+from .state import PrintOptions
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +68,19 @@ REPLY_RESPONSE_SCHEMA = {
             "enum": ["aspose", "cloudmersive"],
             "nullable": True,
         },
+        "page_ranges": {"type": "string", "nullable": True},
+        "paper_size_override": {"type": "string", "nullable": True},
     },
     "required": ["decision"],
+}
+
+EXTRAS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "copies": {"type": "integer", "nullable": True},
+        "page_ranges": {"type": "string", "nullable": True},
+        "paper_size_override": {"type": "string", "nullable": True},
+    },
 }
 
 CLASSIFY_PROMPT_TEMPLATE = """You are a filter for an email-to-printer bot. Decide \
@@ -114,13 +128,19 @@ REPLY_PROMPT_TEMPLATE = """You are interpreting a short reply email sent in \
 response to a print-confirmation request from a bot. Decide the reply's \
 intent.
 
+The printer supports these paper sizes (use exact names for \
+paper_size_override):
+{supported_sizes}
+
 Respond with ONLY a JSON object (no markdown, no extra text) matching this \
 exact shape:
 {{
   "decision": "approve" or "cancel" or "reconvert" or "unclear",
   "copies": an integer number of copies if one is mentioned, or null,
   "fit_on_short": true or false or null,
-  "reconvert_provider": "aspose" or "cloudmersive" or null
+  "reconvert_provider": "aspose" or "cloudmersive" or null,
+  "page_ranges": a CUPS page-ranges string or null,
+  "paper_size_override": one of the supported paper size names or null
 }}
 
 Rules:
@@ -139,10 +159,47 @@ on short/letter bond paper instead of swapping in long bond paper (e.g. \
 Return false or null for a normal approval.
 - reconvert_provider should be "aspose" or "cloudmersive" when decision is \
 "reconvert" and the person names a provider; otherwise null.
+- page_ranges should be null unless the person asks to print specific \
+pages (e.g. "page 2 only" -> "2", "pages 1-3" -> "1-3", "pages 1 and 3" \
+-> "1,3"). Use CUPS page-ranges format: single pages, ranges with hyphens, \
+comma-separated.
+- paper_size_override should be null unless the person explicitly requests \
+a paper size at print time (e.g. "use A4", "print on long bond", "letter \
+size"). Map natural language to one of the supported size names listed \
+above. Do not set this for fit_on_short requests — use fit_on_short instead.
 
 Reply text:
 ---
 {reply_text}
+---
+"""
+
+EXTRAS_PROMPT_TEMPLATE = """You are parsing optional extra print instructions \
+from a user approving a print job on Discord.
+
+The printer supports these paper sizes (use exact names for \
+paper_size_override):
+{supported_sizes}
+
+Respond with ONLY a JSON object (no markdown, no extra text) matching this \
+exact shape:
+{{
+  "copies": an integer number of copies if one is mentioned, or null,
+  "page_ranges": a CUPS page-ranges string or null,
+  "paper_size_override": one of the supported paper size names or null
+}}
+
+Rules:
+- copies should be null unless a specific number of copies is mentioned.
+- page_ranges should be null unless specific pages are requested (e.g. \
+"page 2 only" -> "2", "pages 1-3" -> "1-3"). Use CUPS page-ranges format.
+- paper_size_override should be null unless a paper size is explicitly \
+requested (e.g. "use A4", "long bond"). Map natural language to one of the \
+supported size names listed above.
+
+Instructions text:
+---
+{instructions}
 ---
 """
 
@@ -160,6 +217,14 @@ class ReplyDecision:
     copies: Optional[int]
     fit_on_short: Optional[bool] = None
     reconvert_provider: Optional[str] = None  # "aspose" | "cloudmersive"
+    page_ranges: Optional[str] = None
+    paper_size_override: Optional[str] = None
+
+
+@dataclass
+class ApprovalExtras:
+    copies: Optional[int] = None
+    options: PrintOptions = field(default_factory=PrintOptions)
 
 
 class AllKeysExhaustedError(RuntimeError):
@@ -187,10 +252,37 @@ class GeminiClassifier:
         data = self._generate_json(prompt, CLASSIFY_RESPONSE_SCHEMA)
         return self._classification_from_data(data)
 
-    def classify_reply(self, reply_text: str) -> ReplyDecision:
-        prompt = REPLY_PROMPT_TEMPLATE.format(reply_text=reply_text[:2000])
+    def classify_reply(
+        self, reply_text: str, supported_paper_sizes: list[str] | None = None,
+    ) -> ReplyDecision:
+        supported = supported_paper_sizes or ["Short", "Long"]
+        sizes_text = "\n".join(
+            f'- "{name}"' for name in supported
+        )
+        prompt = REPLY_PROMPT_TEMPLATE.format(
+            supported_sizes=sizes_text,
+            reply_text=reply_text[:2000],
+        )
         data = self._generate_json(prompt, REPLY_RESPONSE_SCHEMA)
-        return self._reply_from_data(data)
+        return self._reply_from_data(data, supported)
+
+    def parse_approval_extras(
+        self, instructions: str, supported_paper_sizes: list[str],
+    ) -> ApprovalExtras:
+        sizes_text = "\n".join(
+            f'- "{name}"' for name in supported_paper_sizes
+        )
+        prompt = EXTRAS_PROMPT_TEMPLATE.format(
+            supported_sizes=sizes_text,
+            instructions=instructions[:2000],
+        )
+        data = self._generate_json(prompt, EXTRAS_RESPONSE_SCHEMA)
+        copies = data.get("copies")
+        options = self._print_options_from_data(data, supported_paper_sizes)
+        return ApprovalExtras(
+            copies=int(copies) if copies is not None else None,
+            options=options,
+        )
 
     # -- shared fallback machinery ------------------------------------------
 
@@ -352,7 +444,28 @@ class GeminiClassifier:
         )
 
     @staticmethod
-    def _reply_from_data(data: dict) -> ReplyDecision:
+    def _print_options_from_data(
+        data: dict, supported_paper_sizes: list[str],
+    ) -> PrintOptions:
+        page_ranges = pdf_utils.normalize_page_ranges(data.get("page_ranges"))
+        raw_size = data.get("paper_size_override")
+        paper_size_override = None
+        if raw_size:
+            paper_size_override = pdf_utils.normalize_paper_size_name(
+                str(raw_size), supported_paper_sizes,
+            )
+            if not paper_size_override:
+                paper_size_override = str(raw_size).strip()
+        return PrintOptions(
+            page_ranges=page_ranges,
+            paper_size_override=paper_size_override,
+        )
+
+    @staticmethod
+    def _reply_from_data(
+        data: dict, supported_paper_sizes: list[str] | None = None,
+    ) -> ReplyDecision:
+        supported = supported_paper_sizes or ["Short", "Long"]
         copies = data.get("copies")
         decision = str(data.get("decision", "unclear"))
         if decision not in ("approve", "cancel", "reconvert", "unclear"):
@@ -363,11 +476,14 @@ class GeminiClassifier:
         reconvert_provider = data.get("reconvert_provider")
         if reconvert_provider not in (None, "aspose", "cloudmersive"):
             reconvert_provider = None
+        options = GeminiClassifier._print_options_from_data(data, supported)
         return ReplyDecision(
             decision=decision,
             copies=int(copies) if copies is not None else None,
             fit_on_short=fit_on_short,
             reconvert_provider=reconvert_provider,
+            page_ranges=options.page_ranges,
+            paper_size_override=options.paper_size_override,
         )
 
     @staticmethod
