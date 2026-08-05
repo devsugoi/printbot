@@ -6,10 +6,13 @@ resolved from an environment variable instead of being stored in plain text.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve(value):
@@ -95,6 +98,10 @@ class CloudmersiveConfig:
 
 @dataclass
 class OfficeConversionConfig:
+    libreoffice_retries: int = 3
+    fallback_order: list[str] = field(
+        default_factory=lambda: ["aspose", "cloudmersive"]
+    )
     aspose: AsposeConfig = field(default_factory=AsposeConfig)
     cloudmersive: CloudmersiveConfig = field(default_factory=CloudmersiveConfig)
 
@@ -183,6 +190,21 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             k: dict(v) for k, v in _DEFAULT_PAPER_PRICES.items()
         }
 
+    _VALID_FALLBACK_BACKENDS = {"aspose", "cloudmersive"}
+    fallback_order_raw = office.get("fallback_order", ["aspose", "cloudmersive"])
+    fallback_order = []
+    for backend in fallback_order_raw:
+        name = str(backend).lower()
+        if name in _VALID_FALLBACK_BACKENDS:
+            fallback_order.append(name)
+        else:
+            logger.warning(
+                "Ignoring unknown office_conversion.fallback_order entry: %r",
+                backend,
+            )
+    if not fallback_order:
+        fallback_order = ["aspose", "cloudmersive"]
+
     return AppConfig(
         gmail=GmailConfig(
             credentials_file=_resolve(gmail["credentials_file"]),
@@ -219,6 +241,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             ),
         ),
         office_conversion=OfficeConversionConfig(
+            libreoffice_retries=int(office.get("libreoffice_retries", 3)),
+            fallback_order=fallback_order,
             aspose=AsposeConfig(
                 enabled=bool(aspose.get("enabled", False)),
                 client_id=(

@@ -345,11 +345,10 @@ class PrintBot(commands.Bot):
                 # converted PDF is marked is_generated so it's attached to
                 # the confirmation ask as a preview.
                 try:
-                    converted = await asyncio.to_thread(
-                        pdf_utils.office_to_pdf,
+                    result = await asyncio.to_thread(
+                        pdf_utils.convert_office_document,
                         p,
                         job_dir,
-                        pdf_utils.BACKEND_LIBREOFFICE,
                         self.app_config.office_conversion,
                     )
                 except pdf_utils.OfficeConversionError:
@@ -366,6 +365,7 @@ class PrintBot(commands.Bot):
                         )
                     )
                     continue
+                converted = result.pdf_path
                 size = ai_paper_size or pdf_utils.detect_pdf_paper_size(
                     converted, supported, default
                 )
@@ -375,7 +375,7 @@ class PrintBot(commands.Bot):
                         paper_size=size,
                         is_generated=True,
                         office_source_path=p,
-                        conversion_backend=pdf_utils.BACKEND_LIBREOFFICE,
+                        conversion_backend=result.backend,
                     )
                 )
                 continue
@@ -417,7 +417,7 @@ class PrintBot(commands.Bot):
         warning = self._paper_warning(job)
 
         reconvert_hint = self._reconvert_hint(job)
-        cost_discord = ""
+        fallback_note = self._conversion_fallback_note(job)
         cost_email = ""
         if estimate is not None:
             cost_discord = (
@@ -440,8 +440,10 @@ class PrintBot(commands.Bot):
             f"**Why:** {ai_reason}"
             + (f"\n\n{warning}" if warning else "")
             + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
+            + (f"\n\n{fallback_note}" if fallback_note else "")
             + cost_discord
         )
+        fallback_note_email = self._conversion_fallback_note(job, for_email=True)
         email_text = (
             f"I think this email is asking to print the attached file(s): "
             f"{file_list}.\n\n"
@@ -451,6 +453,7 @@ class PrintBot(commands.Bot):
             f"on Discord."
             + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
             + (f"\n\n{warning}" if warning else "")
+            + (f"\n\n{fallback_note_email}" if fallback_note_email else "")
             + cost_email
         )
 
@@ -476,6 +479,27 @@ class PrintBot(commands.Bot):
                 oc.cloudmersive.is_available() and has_office
             ),
         }
+
+    def _conversion_fallback_note(self, job: PrintJob, *, for_email: bool = False) -> str:
+        labels = {
+            pdf_utils.BACKEND_ASPOSE: "Aspose",
+            pdf_utils.BACKEND_CLOUDMERSIVE: "Cloudmersive",
+        }
+        used = sorted({
+            labels[f.conversion_backend]
+            for f in job.files
+            if f.office_source_path and f.conversion_backend in labels
+        })
+        if not used:
+            return ""
+        names = " / ".join(used)
+        message = (
+            f"Note: Converted using {names} fallback due to local "
+            f"processing errors."
+        )
+        if for_email:
+            return message
+        return f"_{message}_"
 
     def _reconvert_hint(self, job: PrintJob) -> str:
         if not self._job_has_office_preview(job):

@@ -75,7 +75,13 @@ storage:
   processed_email_retention_days: 30
 
 # Optional cloud reconversion when LibreOffice previews look wrong (see README).
+# When LibreOffice fails, the bot retries locally then tries fallback_order.
 office_conversion:
+  libreoffice_retries: 3
+  fallback_order:
+    - aspose
+    - cloudmersive
+  # Enable at least one provider below for automatic cloud fallback.
   aspose:
     enabled: false
     client_id: "ENV:ASPOSE_CLIENT_ID"

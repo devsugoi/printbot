@@ -442,14 +442,20 @@ class ConfirmationManager:
             # Jobs prepared before office->PDF conversion existed (or whose
             # conversion failed at prepare time) still point at the raw
             # office file -- convert here so reprints of those jobs work.
-            converted = await asyncio.to_thread(
-                pdf_utils.office_to_pdf,
+            office_source = f.office_source_path or path
+            result = await asyncio.to_thread(
+                pdf_utils.convert_office_document,
                 path,
                 os.path.dirname(path),
-                pdf_utils.BACKEND_LIBREOFFICE,
                 self.app_config.office_conversion,
             )
-            path = converted
+            path = result.pdf_path
+            f.path = path
+            f.conversion_backend = result.backend
+            f.office_source_path = office_source
+            if not f.is_generated:
+                f.is_generated = True
+            self.state.save_job(job)
 
         effective_size = f.paper_size
         override = job.approval_options.paper_size_override

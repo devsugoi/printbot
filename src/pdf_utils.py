@@ -8,10 +8,13 @@ size detection via detect_pdf_paper_size / the AI classifier.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,10 +30,18 @@ from reportlab.pdfgen import canvas
 if TYPE_CHECKING:
     from .config import OfficeConversionConfig
 
+logger = logging.getLogger(__name__)
+
 BACKEND_LIBREOFFICE = "libreoffice"
 BACKEND_ASPOSE = "aspose"
 BACKEND_CLOUDMERSIVE = "cloudmersive"
 _CLOUD_BACKENDS = {BACKEND_ASPOSE, BACKEND_CLOUDMERSIVE}
+
+BACKEND_LABELS = {
+    BACKEND_LIBREOFFICE: "LibreOffice",
+    BACKEND_ASPOSE: "Aspose",
+    BACKEND_CLOUDMERSIVE: "Cloudmersive",
+}
 
 # Name -> (width_pt, height_pt), all in portrait orientation.
 # "Short bond paper" = Letter (8.5 x 11 in), "long bond paper" = Legal
@@ -234,6 +245,104 @@ OFFICE_EXTENSIONS = {
 
 class OfficeConversionError(RuntimeError):
     """Raised when an office document could not be converted to PDF."""
+
+
+@dataclass
+class OfficeConversionResult:
+    pdf_path: str
+    backend: str
+    used_fallback: bool
+    libreoffice_attempts: int
+
+
+def _backend_is_available(backend: str, office_config: OfficeConversionConfig) -> bool:
+    if backend == BACKEND_ASPOSE:
+        return office_config.aspose.is_available()
+    if backend == BACKEND_CLOUDMERSIVE:
+        return office_config.cloudmersive.is_available()
+    return False
+
+
+def convert_office_document(
+    input_path: str,
+    output_dir: str | None,
+    office_config: OfficeConversionConfig,
+    *,
+    force: bool = False,
+) -> OfficeConversionResult:
+    """Convert an office document to PDF, retrying LibreOffice then cloud APIs.
+
+    Raises OfficeConversionError if every attempt fails.
+    """
+    output_dir = output_dir or os.path.dirname(input_path) or "."
+    basename = os.path.basename(input_path)
+
+    if not force and office_pdf_cache_valid(
+        input_path, output_dir, BACKEND_LIBREOFFICE
+    ):
+        expected = _office_pdf_output_path(
+            input_path, output_dir, BACKEND_LIBREOFFICE
+        )
+        return OfficeConversionResult(
+            pdf_path=expected,
+            backend=BACKEND_LIBREOFFICE,
+            used_fallback=False,
+            libreoffice_attempts=0,
+        )
+
+    expected = _office_pdf_output_path(
+        input_path, output_dir, BACKEND_LIBREOFFICE
+    )
+    last_error: OfficeConversionError | None = None
+    max_attempts = max(1, office_config.libreoffice_retries)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pdf_path = _office_to_pdf_libreoffice(input_path, output_dir, expected)
+            return OfficeConversionResult(
+                pdf_path=pdf_path,
+                backend=BACKEND_LIBREOFFICE,
+                used_fallback=False,
+                libreoffice_attempts=attempt,
+            )
+        except OfficeConversionError as e:
+            last_error = e
+            logger.warning(
+                "LibreOffice conversion attempt %d/%d failed for %s: %s",
+                attempt, max_attempts, basename, e,
+            )
+            if attempt < max_attempts:
+                time.sleep(1.5)
+
+    for backend in office_config.fallback_order:
+        if not _backend_is_available(backend, office_config):
+            continue
+        try:
+            pdf_path = office_to_pdf(
+                input_path,
+                output_dir,
+                backend,
+                office_config,
+                force=force,
+            )
+            return OfficeConversionResult(
+                pdf_path=pdf_path,
+                backend=backend,
+                used_fallback=True,
+                libreoffice_attempts=max_attempts,
+            )
+        except OfficeConversionError as e:
+            last_error = e
+            logger.warning(
+                "%s fallback conversion failed for %s: %s",
+                BACKEND_LABELS.get(backend, backend), basename, e,
+            )
+
+    detail = str(last_error) if last_error else "no conversion backends available"
+    raise OfficeConversionError(
+        f"Converting {basename} to PDF failed after {max_attempts} "
+        f"LibreOffice attempt(s) and cloud fallback: {detail}"
+    ) from last_error
 
 
 def is_office_file(path: str) -> bool:

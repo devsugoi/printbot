@@ -541,13 +541,17 @@ sudo journalctl -u printbot -f     # logs
   headless LibreOffice (dedicated profile + `writer_pdf_Export` with font
   embedding) before printing, and the converted PDF is attached to the
   confirmation message so you can check the rendering before approving.
-  This requires LibreOffice and Word-compatible fonts on the Pi (see setup
-  step 1); if either is missing or conversion fails, the job fails with a
-  clear message and can be reprinted after fixing the issue. Conversion
-  also runs at print time for jobs prepared before this feature (or whose
-  prepare-time conversion failed), so reprinting an old failed `.docx`
-  job works. Stale converted PDFs are automatically regenerated when the
-  source office file is newer.   If the converted PDF doesn't match Word (wrong page count, shifted
+  LibreOffice is retried up to `office_conversion.libreoffice_retries`
+  times (default 3); if it still fails, the bot automatically tries
+  commercial APIs in `office_conversion.fallback_order` (Aspose, then
+  Cloudmersive by default). Enable at least one provider in config for
+  automatic fallback. When a cloud API is used, the initial Discord/email
+  confirmation includes a note that conversion used a fallback. This
+  requires LibreOffice and Word-compatible fonts on the Pi (see setup
+  step 1); if every backend fails, the job queues the raw office file and
+  conversion is retried at print time. Stale converted PDFs are
+  automatically regenerated when the source office file is newer. If the
+  converted PDF doesn't match Word (wrong page count, shifted
   content), see [DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
   in Troubleshooting. Optional cloud **Reconvert** (Discord buttons or
   email replies like `reconvert aspose`) can try Aspose or Cloudmersive —
