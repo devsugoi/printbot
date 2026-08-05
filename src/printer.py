@@ -46,8 +46,9 @@ _UNAVAILABLE_MARKERS = (
 _LP_REQUEST_ID_RE = re.compile(r"request id is (\S+-\d+)")
 
 # How long to wait for a submitted job to leave the CUPS queue before
-# concluding it is stuck, and how often to check.
-JOB_COMPLETION_TIMEOUT_SECONDS = 30
+# concluding it is stuck, and how often to check. The DCP-J100 is a slow
+# inkjet; multi-page / image-heavy PDFs routinely take well over a minute.
+JOB_COMPLETION_TIMEOUT_SECONDS = 300
 JOB_POLL_INTERVAL_SECONDS = 2
 
 
