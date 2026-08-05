@@ -75,12 +75,40 @@ class StorageConfig:
 
 
 @dataclass
+class AsposeConfig:
+    enabled: bool = False
+    client_id: str = ""
+    client_secret: str = ""
+
+    def is_available(self) -> bool:
+        return self.enabled and bool(self.client_id) and bool(self.client_secret)
+
+
+@dataclass
+class CloudmersiveConfig:
+    enabled: bool = False
+    api_key: str = ""
+
+    def is_available(self) -> bool:
+        return self.enabled and bool(self.api_key)
+
+
+@dataclass
+class OfficeConversionConfig:
+    aspose: AsposeConfig = field(default_factory=AsposeConfig)
+    cloudmersive: CloudmersiveConfig = field(default_factory=CloudmersiveConfig)
+
+
+@dataclass
 class AppConfig:
     gmail: GmailConfig
     gemini: GeminiConfig
     discord: DiscordConfig
     printer: PrinterConfig
     storage: StorageConfig
+    office_conversion: OfficeConversionConfig = field(
+        default_factory=OfficeConversionConfig
+    )
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -98,6 +126,9 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     discord = raw["discord"]
     printer = raw["printer"]
     storage = raw["storage"]
+    office = raw.get("office_conversion", {})
+    aspose = office.get("aspose", {})
+    cloudmersive = office.get("cloudmersive", {})
 
     return AppConfig(
         gmail=GmailConfig(
@@ -132,6 +163,29 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             state_file=storage["state_file"],
             processed_email_retention_days=int(
                 storage.get("processed_email_retention_days", 30)
+            ),
+        ),
+        office_conversion=OfficeConversionConfig(
+            aspose=AsposeConfig(
+                enabled=bool(aspose.get("enabled", False)),
+                client_id=(
+                    _resolve(aspose["client_id"])
+                    if aspose.get("enabled") and aspose.get("client_id")
+                    else ""
+                ),
+                client_secret=(
+                    _resolve(aspose["client_secret"])
+                    if aspose.get("enabled") and aspose.get("client_secret")
+                    else ""
+                ),
+            ),
+            cloudmersive=CloudmersiveConfig(
+                enabled=bool(cloudmersive.get("enabled", False)),
+                api_key=(
+                    _resolve(cloudmersive["api_key"])
+                    if cloudmersive.get("enabled") and cloudmersive.get("api_key")
+                    else ""
+                ),
             ),
         ),
     )

@@ -22,7 +22,7 @@ import discord
 from discord.ext import commands, tasks
 
 from . import gmail_client, pdf_utils
-from .ai_classifier import AllKeysExhaustedError, GeminiClassifier
+from .ai_classifier import AllKeysExhaustedError, GeminiClassifier, ReplyDecision
 from .config import AppConfig
 from .confirmation import ConfirmationManager
 from .state import (
@@ -133,7 +133,7 @@ class PrintBot(commands.Bot):
             if job.status == STATUS_AWAITING_CONFIRMATION:
                 self.add_view(ConfirmView(
                     self.confirmation, job.message_id, owner_id,
-                    has_long_paper=job.has_long_paper_pending(),
+                    **self._confirm_view_kwargs(job),
                 ))
             elif job.status == STATUS_PRINTED:
                 self.add_view(ActionView(
@@ -321,7 +321,11 @@ class PrintBot(commands.Bot):
                 # the confirmation ask as a preview.
                 try:
                     converted = await asyncio.to_thread(
-                        pdf_utils.office_to_pdf, p, job_dir
+                        pdf_utils.office_to_pdf,
+                        p,
+                        job_dir,
+                        pdf_utils.BACKEND_LIBREOFFICE,
+                        self.app_config.office_conversion,
                     )
                 except pdf_utils.OfficeConversionError:
                     logger.exception(
@@ -341,7 +345,13 @@ class PrintBot(commands.Bot):
                     converted, supported, default
                 )
                 files.append(
-                    PrintFile(path=converted, paper_size=size, is_generated=True)
+                    PrintFile(
+                        path=converted,
+                        paper_size=size,
+                        is_generated=True,
+                        office_source_path=p,
+                        conversion_backend=pdf_utils.BACKEND_LIBREOFFICE,
+                    )
                 )
                 continue
 
@@ -376,6 +386,7 @@ class PrintBot(commands.Bot):
         file_list = ", ".join(os.path.basename(f.path) for f in job.files)
         warning = self._paper_warning(job)
 
+        reconvert_hint = self._reconvert_hint(job)
         discord_text = (
             f"🖨️ **Print request detected**\n"
             f"**From:** {job.sender}\n"
@@ -383,12 +394,14 @@ class PrintBot(commands.Bot):
             f"**Files:** {file_list}\n"
             f"**Why:** {ai_reason}"
             + (f"\n\n{warning}" if warning else "")
+            + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
         )
         email_text = (
             f"I think this email is asking to print the attached file(s): "
             f"{file_list}.\n\n"
             f'Reply to this thread with something like "yes, 2 copies" to '
             f'confirm, or "no" to cancel. You can also confirm on Discord.'
+            + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
             + (f"\n\n{warning}" if warning else "")
         )
 
@@ -400,6 +413,51 @@ class PrintBot(commands.Bot):
         await self.confirmation.notify_both(
             job, discord_text, email_text, file_paths=preview_paths
         )
+
+    def _job_has_office_preview(self, job: PrintJob) -> bool:
+        return any(f.office_source_path for f in job.files)
+
+    def _confirm_view_kwargs(self, job: PrintJob) -> dict:
+        oc = self.app_config.office_conversion
+        has_office = self._job_has_office_preview(job)
+        return {
+            "has_long_paper": job.has_long_paper_pending(),
+            "aspose_available": oc.aspose.is_available() and has_office,
+            "cloudmersive_available": (
+                oc.cloudmersive.is_available() and has_office
+            ),
+        }
+
+    def _reconvert_hint(self, job: PrintJob) -> str:
+        if not self._job_has_office_preview(job):
+            return ""
+        oc = self.app_config.office_conversion
+        hints = []
+        if oc.aspose.is_available():
+            hints.append('"reconvert aspose"')
+        if oc.cloudmersive.is_available():
+            hints.append('"reconvert cloudmersive"')
+        if not hints:
+            return ""
+        joined = " or ".join(hints)
+        return (
+            f"If the preview PDF looks wrong, reply {joined} in this thread "
+            f"or use the Reconvert buttons on Discord."
+        )
+
+    def _resolve_email_reconvert_backend(
+        self, decision: ReplyDecision,
+    ) -> Optional[str]:
+        if decision.reconvert_provider == "aspose":
+            return pdf_utils.BACKEND_ASPOSE
+        if decision.reconvert_provider == "cloudmersive":
+            return pdf_utils.BACKEND_CLOUDMERSIVE
+        oc = self.app_config.office_conversion
+        if oc.aspose.is_available():
+            return pdf_utils.BACKEND_ASPOSE
+        if oc.cloudmersive.is_available():
+            return pdf_utils.BACKEND_CLOUDMERSIVE
+        return None
 
     @staticmethod
     def _paper_warning(job: PrintJob) -> str:
@@ -543,6 +601,21 @@ class PrintBot(commands.Bot):
                     await self.confirmation.handle_cancel(
                         job.message_id, source="email", actor=reply.from_address,
                     )
+                elif decision.decision == "reconvert":
+                    backend = self._resolve_email_reconvert_backend(decision)
+                    if backend is None:
+                        logger.info(
+                            "Ignoring reconvert reply for job %s "
+                            "(no cloud provider configured)",
+                            job.message_id,
+                        )
+                    else:
+                        await self.confirmation.reconvert_office_files(
+                            job.message_id,
+                            backend,
+                            source="email",
+                            actor=reply.from_address,
+                        )
                 # "unclear" -> leave it; wait for a clearer reply.
 
     # -- Discord notification callback (called by confirmation.py) --------
@@ -559,7 +632,7 @@ class PrintBot(commands.Bot):
         if job.status == STATUS_AWAITING_CONFIRMATION:
             view = ConfirmView(
                 self.confirmation, job.message_id, owner_id,
-                has_long_paper=job.has_long_paper_pending(),
+                **self._confirm_view_kwargs(job),
             )
         elif job.status == STATUS_PRINTED:
             view = ActionView(
@@ -664,6 +737,7 @@ class ConfirmView(discord.ui.View):
     def __init__(
         self, confirmation: ConfirmationManager, message_id: str,
         owner_id: int, has_long_paper: bool = False,
+        aspose_available: bool = False, cloudmersive_available: bool = False,
     ):
         super().__init__(timeout=None)
         self.confirmation = confirmation
@@ -685,6 +759,25 @@ class ConfirmView(discord.ui.View):
             )
             short_btn.callback = self._on_print_short
             self.add_item(short_btn)
+
+        if aspose_available:
+            aspose_btn = discord.ui.Button(
+                label="Reconvert (Aspose)", style=discord.ButtonStyle.secondary,
+                emoji="☁️",
+                custom_id=f"printbot:reconvert-aspose:{message_id}",
+            )
+            aspose_btn.callback = self._on_reconvert_aspose
+            self.add_item(aspose_btn)
+
+        if cloudmersive_available:
+            cloud_btn = discord.ui.Button(
+                label="Reconvert (Cloudmersive)",
+                style=discord.ButtonStyle.secondary,
+                emoji="☁️",
+                custom_id=f"printbot:reconvert-cloudmersive:{message_id}",
+            )
+            cloud_btn.callback = self._on_reconvert_cloudmersive
+            self.add_item(cloud_btn)
 
         cancel_btn = discord.ui.Button(
             label="Cancel", style=discord.ButtonStyle.danger, emoji="🚫",
@@ -719,6 +812,24 @@ class ConfirmView(discord.ui.View):
         await interaction.response.defer()
         await self.confirmation.handle_cancel(
             self.message_id, source="discord", actor=str(interaction.user)
+        )
+
+    async def _on_reconvert_aspose(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.confirmation.reconvert_office_files(
+            self.message_id,
+            pdf_utils.BACKEND_ASPOSE,
+            source="discord",
+            actor=str(interaction.user),
+        )
+
+    async def _on_reconvert_cloudmersive(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.confirmation.reconvert_office_files(
+            self.message_id,
+            pdf_utils.BACKEND_CLOUDMERSIVE,
+            source="discord",
+            actor=str(interaction.user),
         )
 
 

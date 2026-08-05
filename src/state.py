@@ -42,6 +42,8 @@ class PrintFile:
     is_generated: bool = False  # True if the bot built this file itself
                                  # (e.g. images combined into one PDF)
     scaled_path: Optional[str] = None  # Letter-fit PDF when Long -> Short
+    office_source_path: Optional[str] = None  # original office file if path is a converted PDF
+    conversion_backend: Optional[str] = None  # libreoffice | aspose | cloudmersive
 
 
 @dataclass

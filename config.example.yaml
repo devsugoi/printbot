@@ -71,3 +71,13 @@ storage:
   # (confirmations, cancellations, "print again"/reprint requests) before
   # the bot stops polling it.
   processed_email_retention_days: 30
+
+# Optional cloud reconversion when LibreOffice previews look wrong (see README).
+office_conversion:
+  aspose:
+    enabled: false
+    client_id: "ENV:ASPOSE_CLIENT_ID"
+    client_secret: "ENV:ASPOSE_CLIENT_SECRET"
+  cloudmersive:
+    enabled: false
+    api_key: "ENV:CLOUDMERSIVE_API_KEY"

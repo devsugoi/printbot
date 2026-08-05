@@ -156,6 +156,97 @@ class ConfirmationManager:
                 ),
             )
 
+    async def reconvert_office_files(
+        self, message_id: str, backend: str, source: str, actor: str,
+    ) -> bool:
+        """Reconvert office attachments with a cloud backend and send new previews."""
+        provider_label = (
+            "Aspose" if backend == pdf_utils.BACKEND_ASPOSE else "Cloudmersive"
+        )
+        oc = self.app_config.office_conversion
+
+        job = self.state.get_job(message_id)
+        if job is None:
+            return False
+
+        if backend == pdf_utils.BACKEND_ASPOSE and not oc.aspose.is_available():
+            await self.notify_both(
+                job,
+                discord_text=f"❌ {provider_label} reconvert is not configured.",
+                email_text=f"{provider_label} reconvert is not configured.",
+            )
+            return False
+        if (
+            backend == pdf_utils.BACKEND_CLOUDMERSIVE
+            and not oc.cloudmersive.is_available()
+        ):
+            await self.notify_both(
+                job,
+                discord_text=f"❌ {provider_label} reconvert is not configured.",
+                email_text=f"{provider_label} reconvert is not configured.",
+            )
+            return False
+
+        async with self._lock_for(message_id):
+            if job is None or job.status != STATUS_AWAITING_CONFIRMATION:
+                logger.info(
+                    "Ignoring reconvert for job %s (status=%s)",
+                    message_id,
+                    job.status if job else "missing",
+                )
+                return False
+
+            office_files = [f for f in job.files if f.office_source_path]
+            if not office_files:
+                logger.info(
+                    "Ignoring reconvert for job %s (no office files)", message_id,
+                )
+                return False
+
+            try:
+                for f in office_files:
+                    source_path = f.office_source_path
+                    assert source_path is not None
+                    converted = await asyncio.to_thread(
+                        pdf_utils.office_to_pdf,
+                        source_path,
+                        os.path.dirname(source_path),
+                        backend,
+                        oc,
+                        True,
+                    )
+                    f.path = converted
+                    f.conversion_backend = backend
+                    f.scaled_path = None
+                self.state.save_job(job)
+            except pdf_utils.OfficeConversionError as e:
+                logger.error(
+                    "Cloud reconvert failed for job %s via %s: %s",
+                    message_id, backend, e,
+                )
+                await self.notify_both(
+                    job,
+                    discord_text=(
+                        f"❌ {provider_label} reconvert failed: {e}"
+                    ),
+                    email_text=f"{provider_label} reconvert failed: {e}",
+                )
+                return False
+
+        await self.notify_both(
+            job,
+            discord_text=(
+                f"🔄 Reconverted with {provider_label} via {source} ({actor}) "
+                f"— check the new preview before printing."
+            ),
+            email_text=(
+                f"Reconverted with {provider_label}. The updated preview PDF "
+                f"is attached — reply yes to print when it looks right."
+            ),
+            file_paths=[f.path for f in job.generated_files()],
+        )
+        return True
+
     # -- printing -------------------------------------------------------
 
     async def _print_job(self, job: PrintJob):
@@ -323,12 +414,18 @@ class ConfirmationManager:
         Raises pdf_utils.OfficeConversionError if an office file can't be
         converted (e.g. LibreOffice missing)."""
         path = f.path
-        if pdf_utils.is_office_file(path):
+        if f.office_source_path and pdf_utils.is_pdf_file(path):
+            pass
+        elif pdf_utils.is_office_file(path):
             # Jobs prepared before office->PDF conversion existed (or whose
             # conversion failed at prepare time) still point at the raw
             # office file -- convert here so reprints of those jobs work.
             converted = await asyncio.to_thread(
-                pdf_utils.office_to_pdf, path, os.path.dirname(path)
+                pdf_utils.office_to_pdf,
+                path,
+                os.path.dirname(path),
+                pdf_utils.BACKEND_LIBREOFFICE,
+                self.app_config.office_conversion,
             )
             path = converted
 

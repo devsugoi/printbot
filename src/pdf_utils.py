@@ -12,12 +12,23 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import requests
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
+
+if TYPE_CHECKING:
+    from .config import OfficeConversionConfig
+
+BACKEND_LIBREOFFICE = "libreoffice"
+BACKEND_ASPOSE = "aspose"
+BACKEND_CLOUDMERSIVE = "cloudmersive"
+_CLOUD_BACKENDS = {BACKEND_ASPOSE, BACKEND_CLOUDMERSIVE}
 
 # Name -> (width_pt, height_pt), all in portrait orientation.
 # "Short bond paper" = Letter (8.5 x 11 in), "long bond paper" = Legal
@@ -171,10 +182,21 @@ def is_office_file(path: str) -> bool:
 
 
 def converted_pdf_path(input_path: str) -> str:
-    """The path LibreOffice will write when converting `input_path` to PDF
-    in the same directory (basename with the extension swapped to .pdf)."""
+    """LibreOffice output path (basename with .pdf extension)."""
     base, _ = os.path.splitext(input_path)
     return base + ".pdf"
+
+
+def converted_pdf_path_for_backend(input_path: str, backend: str) -> str:
+    """Output PDF path for a given conversion backend."""
+    base, _ = os.path.splitext(input_path)
+    if backend == BACKEND_LIBREOFFICE:
+        return base + ".pdf"
+    if backend == BACKEND_ASPOSE:
+        return base + ".aspose.pdf"
+    if backend == BACKEND_CLOUDMERSIVE:
+        return base + ".cloudmersive.pdf"
+    raise ValueError(f"Unknown office conversion backend: {backend}")
 
 
 _LIBREOFFICE_PROFILE_DIR = ".libreoffice-printbot"
@@ -203,31 +225,71 @@ def _ensure_libreoffice_profile() -> None:
         shutil.copy(_REGISTRY_TEMPLATE, registry)
 
 
-def _office_pdf_output_path(input_path: str, output_dir: str) -> str:
-    return os.path.join(output_dir, converted_pdf_path(os.path.basename(input_path)))
+def _office_pdf_output_path(
+    input_path: str, output_dir: str, backend: str = BACKEND_LIBREOFFICE,
+) -> str:
+    return os.path.join(
+        output_dir,
+        os.path.basename(converted_pdf_path_for_backend(input_path, backend)),
+    )
 
 
-def office_pdf_cache_valid(input_path: str, output_dir: str | None = None) -> bool:
+def office_pdf_cache_valid(
+    input_path: str,
+    output_dir: str | None = None,
+    backend: str = BACKEND_LIBREOFFICE,
+) -> bool:
     """True if a converted PDF exists and is at least as new as the source."""
     output_dir = output_dir or os.path.dirname(input_path) or "."
-    expected = _office_pdf_output_path(input_path, output_dir)
+    expected = _office_pdf_output_path(input_path, output_dir, backend)
     if not os.path.exists(expected) or not os.path.exists(input_path):
         return False
     return os.path.getmtime(expected) >= os.path.getmtime(input_path)
 
 
-def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
-    """Converts an office document (.docx, .xlsx, ...) to PDF using
-    headless LibreOffice, returning the path of the generated PDF.
+def office_to_pdf(
+    input_path: str,
+    output_dir: str | None = None,
+    backend: str = BACKEND_LIBREOFFICE,
+    office_config: OfficeConversionConfig | None = None,
+    force: bool = False,
+) -> str:
+    """Converts an office document to PDF using the requested backend.
 
-    Raises OfficeConversionError if LibreOffice is not installed or the
-    conversion fails, with a message suitable for showing to the user.
+    Raises OfficeConversionError if conversion fails.
     """
     output_dir = output_dir or os.path.dirname(input_path) or "."
-    expected = _office_pdf_output_path(input_path, output_dir)
-    if office_pdf_cache_valid(input_path, output_dir):
+    expected = _office_pdf_output_path(input_path, output_dir, backend)
+    if not force and office_pdf_cache_valid(input_path, output_dir, backend):
         return expected
 
+    if backend == BACKEND_LIBREOFFICE:
+        return _office_to_pdf_libreoffice(input_path, output_dir, expected)
+    if backend == BACKEND_ASPOSE:
+        if office_config is None or not office_config.aspose.is_available():
+            raise OfficeConversionError(
+                "Aspose cloud conversion is not configured. "
+                "See README for setup."
+            )
+        return _office_to_pdf_aspose(
+            input_path, expected, office_config.aspose.client_id,
+            office_config.aspose.client_secret,
+        )
+    if backend == BACKEND_CLOUDMERSIVE:
+        if office_config is None or not office_config.cloudmersive.is_available():
+            raise OfficeConversionError(
+                "Cloudmersive cloud conversion is not configured. "
+                "See README for setup."
+            )
+        return _office_to_pdf_cloudmersive(
+            input_path, expected, office_config.cloudmersive.api_key,
+        )
+    raise OfficeConversionError(f"Unknown conversion backend: {backend}")
+
+
+def _office_to_pdf_libreoffice(
+    input_path: str, output_dir: str, expected: str,
+) -> str:
     binary = shutil.which("soffice") or shutil.which("libreoffice")
     if binary is None:
         raise OfficeConversionError(
@@ -258,4 +320,61 @@ def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
             f"Converting {os.path.basename(input_path)} to PDF failed"
             + (f": {detail}" if detail else ".")
         )
+    return expected
+
+
+def _office_to_pdf_aspose(
+    input_path: str, expected: str, client_id: str, client_secret: str,
+) -> str:
+    try:
+        import asposewordscloud
+        from asposewordscloud.models.requests import ConvertDocumentRequest
+    except ImportError as e:
+        raise OfficeConversionError(
+            "Aspose SDK is not installed. Run: pip install aspose-words-cloud"
+        ) from e
+
+    words_api = asposewordscloud.WordsApi(client_id, client_secret)
+    try:
+        with open(input_path, "rb") as doc:
+            request = ConvertDocumentRequest(document=doc, format="pdf")
+            result = words_api.convert_document(request)
+    except Exception as e:
+        raise OfficeConversionError(
+            f"Aspose conversion failed for {os.path.basename(input_path)}: {e}"
+        ) from e
+
+    with open(expected, "wb") as out:
+        out.write(result)
+    return expected
+
+
+def _office_to_pdf_cloudmersive(
+    input_path: str, expected: str, api_key: str,
+) -> str:
+    url = "https://api.cloudmersive.com/convert/autodetect/to/pdf"
+    try:
+        with open(input_path, "rb") as doc:
+            response = requests.post(
+                url,
+                headers={"Apikey": api_key},
+                files={"inputFile": (os.path.basename(input_path), doc)},
+                timeout=300,
+            )
+    except requests.RequestException as e:
+        raise OfficeConversionError(
+            f"Cloudmersive conversion failed for "
+            f"{os.path.basename(input_path)}: {e}"
+        ) from e
+
+    if response.status_code != 200:
+        detail = (response.text or "").strip()[:500]
+        raise OfficeConversionError(
+            f"Cloudmersive conversion failed for "
+            f"{os.path.basename(input_path)} (HTTP {response.status_code})"
+            + (f": {detail}" if detail else ".")
+        )
+
+    with open(expected, "wb") as out:
+        out.write(response.content)
     return expected

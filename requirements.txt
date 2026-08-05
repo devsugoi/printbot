@@ -16,3 +16,5 @@ PyYAML>=6.0.1
 reportlab>=4.2.0
 Pillow>=10.4.0
 pypdf>=4.3.0
+requests>=2.31.0
+aspose-words-cloud>=25.1.0

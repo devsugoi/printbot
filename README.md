@@ -57,7 +57,7 @@ printbot/
 │   ├── state.py              # JSON persistence: jobs, files, paper-size groups
 │   ├── gmail_client.py       # Gmail API: search, download, reply-in-thread, read replies
 │   ├── ai_classifier.py      # Gemini: is-it-a-print-request + reply-intent parsing
-│   ├── pdf_utils.py          # image→PDF, paper size detection for real documents
+│   ├── pdf_utils.py          # image→PDF, office→PDF (LibreOffice / Aspose / Cloudmersive)
 │   ├── printer.py            # CUPS `lp` wrapper (paper size, copies)
 │   ├── confirmation.py       # shared approve/cancel/print logic + the "first wins" lock
 │   └── discord_bot.py        # Gmail + email-reply polling, Discord UI
@@ -87,9 +87,11 @@ libreoffice-impress` covers the same formats with a smaller footprint.
 Office documents are converted to PDF by LibreOffice before printing.
 If pagination doesn't match Word, it's usually a **missing font** — see
 [DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
-in Troubleshooting. The bot uses a dedicated LibreOffice profile
-(`.libreoffice-printbot/`) with inch-based layout and font embedding for
-closer Word-like output.
+in Troubleshooting. Optional **cloud reconvert** (Aspose or Cloudmersive)
+can retry conversion when the LibreOffice preview still looks wrong — see
+[section 8](#8-optional-cloud-reconvert-aspose--cloudmersive). The bot uses
+a dedicated LibreOffice profile (`.libreoffice-printbot/`) with inch-based
+layout and font embedding for closer Word-like output.
 
 Install the Brother DCP-J100 driver and add the printer. **The DCP-J100
 is an inkjet — do NOT use `printer-driver-brlaser`**, which only supports
@@ -236,9 +238,9 @@ unread until a later poll can classify it (or you approve it the other way).
 4. Get your own Discord **user ID** (enable Developer Mode in Discord
    settings, right-click your name → Copy User ID) and the **channel ID**
    you want it to post in (right-click channel → Copy Channel ID).
-5. Only your user ID can press the Print / Cancel / Print again / Reprint
-   buttons or run `!reprint` / `!status` — other members in the channel
-   can see the messages but not act on them.
+5. Only your user ID can press the Print / Cancel / Reconvert / Print again
+   / Reprint buttons or run `!reprint` / `!status` — other members in the
+   channel can see the messages but not act on them.
 
 ## 6. Email-based confirmation & who's allowed to approve
 
@@ -247,10 +249,14 @@ thread** asking you to confirm, e.g.:
 
 > I think this email is asking to print the attached file(s): scan.jpg.
 > Reply with something like "yes, 2 copies" to confirm, or "no" to cancel.
-> You can also confirm on Discord.
+> You can also confirm on Discord. If the preview looks wrong, reply
+> "reconvert aspose" or "reconvert cloudmersive" (when configured), or use
+> the Reconvert buttons on Discord.
 
 A later reply like *"yeah go ahead, 3 copies"* or *"nope, cancel that"* is
-interpreted by Gemini and acted on. **Whichever channel responds first
+interpreted by Gemini and acted on. Replies like *"reconvert aspose"* or
+*"try cloudmersive"* trigger a cloud PDF reconvert instead of printing.
+**Whichever channel responds first
 wins** — if you tap Print in Discord, the bot won't also print because a
 reply happened to arrive moments later (and vice versa); both channels
 just get told the job is already being handled.
@@ -295,7 +301,116 @@ discord:
 
 and set those variables (e.g. in a systemd `EnvironmentFile`, see below).
 
-## 8. Run it
+## 8. Optional: Cloud reconvert (Aspose + Cloudmersive)
+
+By default, office attachments (`.docx`, `.xlsx`, etc.) are converted to
+PDF locally with LibreOffice. When the preview has wrong pagination or
+layout, you can trigger a **reconvert** through a commercial cloud API —
+without printing until you approve the new preview.
+
+Reconvert is available on **both channels**:
+
+| Channel | How to trigger |
+|---------|----------------|
+| **Discord** | **Reconvert (Aspose)** or **Reconvert (Cloudmersive)** on the confirmation message (buttons only appear when that provider is enabled) |
+| **Email** | Reply in the thread, e.g. `reconvert aspose`, `reconvert cloudmersive`, or just `reconvert` (defaults to Aspose if enabled, else Cloudmersive) |
+
+Reconvert swaps the preview PDF only — the job stays at "awaiting
+confirmation" until you press **Print** or reply `yes`.
+
+### Provider comparison
+
+| | **Aspose.Words Cloud** | **Cloudmersive** |
+|---|------------------------|------------------|
+| **Quality** | Generally closer to Microsoft Word layout | Good; may differ on complex docs |
+| **Free tier** | ~150 API calls/month | ~600 API calls/month |
+| **Signup** | [dashboard.aspose.cloud](https://dashboard.aspose.cloud/) | [account.cloudmersive.com](https://account.cloudmersive.com/) |
+| **Credentials** | Client ID + Client Secret | API key |
+| **Cost per reconvert** | 1 API call per office file | 1 API call per office file |
+
+Both providers are optional and independent — enable one, both, or neither.
+LibreOffice remains the default for the initial preview.
+
+**Privacy:** reconverting uploads your document to the provider's servers.
+Only enable this if you're comfortable with that for the files you print.
+
+### Aspose.Words Cloud setup
+
+1. Create a free account at
+   [dashboard.aspose.cloud](https://dashboard.aspose.cloud/).
+2. In the dashboard, create an application (or use the default one).
+3. Copy the **Client ID** and **Client Secret**.
+4. Add to `config.yaml`:
+
+   ```yaml
+   office_conversion:
+     aspose:
+       enabled: true
+       client_id: "ENV:ASPOSE_CLIENT_ID"
+       client_secret: "ENV:ASPOSE_CLIENT_SECRET"
+   ```
+
+5. Set the environment variables (e.g. in `printbot.env` for systemd):
+
+   ```
+   ASPOSE_CLIENT_ID=your_client_id_here
+   ASPOSE_CLIENT_SECRET=your_client_secret_here
+   ```
+
+### Cloudmersive setup
+
+1. Create a free account at
+   [account.cloudmersive.com](https://account.cloudmersive.com/).
+2. Open **API Keys** and copy your key.
+3. Add to `config.yaml`:
+
+   ```yaml
+   office_conversion:
+     cloudmersive:
+       enabled: true
+       api_key: "ENV:CLOUDMERSIVE_API_KEY"
+   ```
+
+4. Set the environment variable:
+
+   ```
+   CLOUDMERSIVE_API_KEY=your_api_key_here
+   ```
+
+You can enable both providers at once — each gets its own reconvert button
+and email phrase. A full example with both disabled by default is in
+`config.example.yaml`.
+
+After changing config or env vars, restart the bot. The Python packages
+(`aspose-words-cloud`, `requests`) are already listed in
+`requirements.txt` — run `pip install -r requirements.txt` if you
+haven't since pulling this feature.
+
+### Manual test (on the Pi)
+
+Replace the path with a real `.docx` from a job folder:
+
+```bash
+cd ~/printbot && source venv/bin/activate
+python3 -c "
+from src.config import load_config
+from src.pdf_utils import (
+    office_to_pdf, BACKEND_ASPOSE, BACKEND_CLOUDMERSIVE,
+)
+cfg = load_config()
+path = 'jobs/<message_id>/YourFile.docx'
+print('aspose:', office_to_pdf(
+    path, '/tmp/test', BACKEND_ASPOSE, cfg.office_conversion, force=True))
+print('cloudmersive:', office_to_pdf(
+    path, '/tmp/test', BACKEND_CLOUDMERSIVE, cfg.office_conversion, force=True))
+"
+```
+
+Compare `/tmp/test/YourFile.aspose.pdf` and
+`/tmp/test/YourFile.cloudmersive.pdf` against the LibreOffice
+`YourFile.pdf` in the job folder.
+
+## 9. Run it
 
 ```bash
 python3 main.py
@@ -303,7 +418,7 @@ python3 main.py
 
 You should see a "🖨️ Print bot is online" message in your Discord channel.
 
-## 9. Run it automatically on boot (systemd)
+## 10. Run it automatically on boot (systemd)
 
 `/etc/systemd/system/printbot.service`:
 
@@ -332,6 +447,10 @@ WantedBy=multi-user.target
 GEMINI_API_KEY_1=...
 GEMINI_API_KEY_2=...
 DISCORD_BOT_TOKEN=...
+# Optional — only if office_conversion.*.enabled is true:
+ASPOSE_CLIENT_ID=...
+ASPOSE_CLIENT_SECRET=...
+CLOUDMERSIVE_API_KEY=...
 ```
 
 ```bash
@@ -364,8 +483,9 @@ sudo journalctl -u printbot -f     # logs
     short bond" — long-sized PDFs are scaled to fit letter paper so you
     don't have to swap the tray.
 - You get a Discord message with **Print** / **Cancel** buttons (plus
-  **Print on short bond** when long paper is needed), and a reply in the
-  email thread with the same information. Clicking **Print** (or replying
+  **Print on short bond** when long paper is needed, and **Reconvert**
+  buttons when cloud providers are configured), and a reply in the email
+  thread with the same information. Clicking **Print** (or replying
   "yes") opens/asks for **how many copies** — leave it blank to default to
   1.
 - Whichever channel you respond on first is honored; both channels then
@@ -415,10 +535,11 @@ sudo journalctl -u printbot -f     # logs
   also runs at print time for jobs prepared before this feature (or whose
   prepare-time conversion failed), so reprinting an old failed `.docx`
   job works. Stale converted PDFs are automatically regenerated when the
-  source office file is newer. If the converted PDF doesn't match Word
-  (wrong page count, shifted content), see
-  [DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
-  in Troubleshooting — missing fonts are the usual cause.
+  source office file is newer.   If the converted PDF doesn't match Word (wrong page count, shifted
+  content), see [DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
+  in Troubleshooting. Optional cloud **Reconvert** (Discord buttons or
+  email replies like `reconvert aspose`) can try Aspose or Cloudmersive —
+  see [section 8](#8-optional-cloud-reconvert-aspose--cloudmersive).
 - **Other non-image, non-PDF attachments** are still sent to `lp` as-is;
   whether those print depends on your CUPS filters.
 - **Attachment size limits for previews**: Discord (~25MB on most servers)
@@ -545,6 +666,12 @@ in `ttf-mscorefonts-installer`.
 5. **Workflow workarounds** when layout must match Word exactly:
    - Email a **PDF exported from Word** instead of the `.docx`
    - Or convert on a Windows machine with Word before sending
+
+6. **Cloud reconvert (optional)** — if fonts are installed but LibreOffice
+   still paginates wrong, enable Aspose and/or Cloudmersive (see
+   [section 8](#8-optional-cloud-reconvert-aspose--cloudmersive)) and
+   trigger a reconvert from Discord or by replying `reconvert aspose` /
+   `reconvert cloudmersive` in the email thread.
 
 **Re-test after installing fonts:**
 

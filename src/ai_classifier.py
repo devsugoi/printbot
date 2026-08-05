@@ -56,10 +56,15 @@ REPLY_RESPONSE_SCHEMA = {
     "properties": {
         "decision": {
             "type": "string",
-            "enum": ["approve", "cancel", "unclear"],
+            "enum": ["approve", "cancel", "reconvert", "unclear"],
         },
         "copies": {"type": "integer", "nullable": True},
         "fit_on_short": {"type": "boolean", "nullable": True},
+        "reconvert_provider": {
+            "type": "string",
+            "enum": ["aspose", "cloudmersive"],
+            "nullable": True,
+        },
     },
     "required": ["decision"],
 }
@@ -112,9 +117,10 @@ intent.
 Respond with ONLY a JSON object (no markdown, no extra text) matching this \
 exact shape:
 {{
-  "decision": "approve" or "cancel" or "unclear",
+  "decision": "approve" or "cancel" or "reconvert" or "unclear",
   "copies": an integer number of copies if one is mentioned, or null,
-  "fit_on_short": true or false or null
+  "fit_on_short": true or false or null,
+  "reconvert_provider": "aspose" or "cloudmersive" or null
 }}
 
 Rules:
@@ -122,12 +128,17 @@ Rules:
 "go ahead", "print it", "print again", "reprint", "do it").
 - "cancel" means the person wants it NOT printed, or stopped (e.g. "no", \
 "cancel", "stop", "don't print that").
-- "unclear" if the reply doesn't clearly indicate either.
+- "reconvert" means the person wants a better PDF preview because the \
+current conversion looks wrong (e.g. "reconvert", "reconvert aspose", \
+"try cloudmersive", "conversion looks wrong", "bad preview").
+- "unclear" if the reply doesn't clearly indicate any of the above.
 - copies should be null unless a specific number of copies is mentioned.
 - fit_on_short should be true only if the person explicitly wants to print \
 on short/letter bond paper instead of swapping in long bond paper (e.g. \
 "use short bond", "print on letter", "fit on short", "don't swap paper"). \
 Return false or null for a normal approval.
+- reconvert_provider should be "aspose" or "cloudmersive" when decision is \
+"reconvert" and the person names a provider; otherwise null.
 
 Reply text:
 ---
@@ -145,9 +156,10 @@ class ClassificationResult:
 
 @dataclass
 class ReplyDecision:
-    decision: str  # "approve" | "cancel" | "unclear"
+    decision: str  # "approve" | "cancel" | "reconvert" | "unclear"
     copies: Optional[int]
     fit_on_short: Optional[bool] = None
+    reconvert_provider: Optional[str] = None  # "aspose" | "cloudmersive"
 
 
 class AllKeysExhaustedError(RuntimeError):
@@ -343,15 +355,19 @@ class GeminiClassifier:
     def _reply_from_data(data: dict) -> ReplyDecision:
         copies = data.get("copies")
         decision = str(data.get("decision", "unclear"))
-        if decision not in ("approve", "cancel", "unclear"):
+        if decision not in ("approve", "cancel", "reconvert", "unclear"):
             decision = "unclear"
         fit_on_short = data.get("fit_on_short")
         if fit_on_short is not None:
             fit_on_short = bool(fit_on_short)
+        reconvert_provider = data.get("reconvert_provider")
+        if reconvert_provider not in (None, "aspose", "cloudmersive"):
+            reconvert_provider = None
         return ReplyDecision(
             decision=decision,
             copies=int(copies) if copies is not None else None,
             fit_on_short=fit_on_short,
+            reconvert_provider=reconvert_provider,
         )
 
     @staticmethod
