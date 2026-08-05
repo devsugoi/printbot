@@ -418,7 +418,8 @@ Compare `/tmp/test/YourFile.aspose.pdf` and
 python3 main.py
 ```
 
-You should see a "🖨️ Print bot is online" message in your Discord channel.
+The bot logs in silently to Discord (no startup channel message). Check the
+terminal for `Logged in as ...` to confirm it connected.
 
 ## 10. Run it automatically on boot (systemd)
 
@@ -522,6 +523,9 @@ sudo journalctl -u printbot -f     # logs
 
 ## Customization notes
 
+- **Discord approval ping**: set `discord.mention_on_print_request: true`
+  in `config.yaml` to @-mention your `discord.user_id` when a new print
+  job needs approval (initial ask only, not tray-swap or reconvert messages).
 - **Search query**: tighten `gmail.search_query` (e.g. add
   `from:family@example.com`) to reduce how much gets sent to Gemini and
   avoid burning through free-tier quota on irrelevant mail.

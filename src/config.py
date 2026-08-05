@@ -61,6 +61,7 @@ class DiscordConfig:
     user_id: int
     channel_id: int
     command_prefix: str = "!"
+    mention_on_print_request: bool = False
 
 
 @dataclass
@@ -227,6 +228,9 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             user_id=int(discord["user_id"]),
             channel_id=int(discord["channel_id"]),
             command_prefix=discord.get("command_prefix", "!"),
+            mention_on_print_request=bool(
+                discord.get("mention_on_print_request", False)
+            ),
         ),
         printer=PrinterConfig(
             name=_resolve(printer["name"]),

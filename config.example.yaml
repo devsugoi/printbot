@@ -52,6 +52,8 @@ discord:
   channel_id: 123456789012345678
   # Command prefix for text commands like !reprint and !status
   command_prefix: "!"
+  # Ping your Discord user in the channel when a new print job needs approval.
+  mention_on_print_request: false
 
 printer:
   # CUPS printer name as shown by `lpstat -p`, e.g. "Brother_DCP_J100"

@@ -57,7 +57,6 @@ class PrintBot(commands.Bot):
         self.owner_email = ""           # set in setup_hook
         self.confirmation: Optional[ConfirmationManager] = None
         self._notify_channel: discord.abc.Messageable | None = None
-        self._announced_online = False
 
         self._register_commands()
 
@@ -165,13 +164,6 @@ class PrintBot(commands.Bot):
             logger.error(
                 "Discord channel %s not found; notifications will be dropped.",
                 self.app_config.discord.channel_id,
-            )
-            return
-        if not self._announced_online:
-            self._announced_online = True
-            await channel.send(
-                "🖨️ Print bot is online — watching Gmail for print requests and "
-                "this channel + email for confirmations."
             )
 
     def _is_owner(self, user: discord.abc.User) -> bool:
@@ -418,6 +410,7 @@ class PrintBot(commands.Bot):
 
         reconvert_hint = self._reconvert_hint(job)
         fallback_note = self._conversion_fallback_note(job)
+        cost_discord = ""
         cost_email = ""
         if estimate is not None:
             cost_discord = (
@@ -432,8 +425,12 @@ class PrintBot(commands.Bot):
                     estimate, self.app_config.cost_estimation
                 )
             )
+        mention_prefix = ""
+        if self.app_config.discord.mention_on_print_request:
+            mention_prefix = f"<@{self.app_config.discord.user_id}> "
         discord_text = (
-            f"🖨️ **Print request detected**\n"
+            mention_prefix
+            + f"🖨️ **Print request detected**\n"
             f"**From:** {job.sender}\n"
             f"**Subject:** {job.subject}\n"
             f"**Files:** {file_list}\n"
