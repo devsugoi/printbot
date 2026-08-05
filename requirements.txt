@@ -18,3 +18,4 @@ Pillow>=10.4.0
 pypdf>=4.3.0
 requests>=2.31.0
 aspose-words-cloud>=25.1.0
+pycryptodome>=3.20.0  # required by aspose-words-cloud (Crypto module)
