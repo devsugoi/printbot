@@ -84,16 +84,12 @@ bot converts them to PDF with `soffice --headless` first. On a
 storage-constrained Pi, `libreoffice-writer libreoffice-calc
 libreoffice-impress` covers the same formats with a smaller footprint.
 
-**DOCX pagination:** If a Word document is 2 pages but the converted PDF
-is 3 (content spilling to the next page), the Pi is almost certainly
-missing the fonts the DOCX uses. Install the font packages above
-(Carlito/Caladea are metric-compatible Calibri/Cambria substitutes;
-Liberation covers Arial/Times/Courier; `mscorefonts` adds real Arial and
-Times New Roman). After installing fonts, delete any stale converted PDF
-next to the `.docx` under `jobs/` (or reprint after removing the cached
-`.pdf`) so LibreOffice reconverts with the new fonts. The bot uses a
-dedicated LibreOffice profile (`.libreoffice-printbot/`) with inch-based
-layout and font embedding for closer Word-like output.
+Office documents are converted to PDF by LibreOffice before printing.
+If pagination doesn't match Word, it's usually a **missing font** — see
+[DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
+in Troubleshooting. The bot uses a dedicated LibreOffice profile
+(`.libreoffice-printbot/`) with inch-based layout and font embedding for
+closer Word-like output.
 
 Install the Brother DCP-J100 driver and add the printer. **The DCP-J100
 is an inkjet — do NOT use `printer-driver-brlaser`**, which only supports
@@ -419,9 +415,10 @@ sudo journalctl -u printbot -f     # logs
   also runs at print time for jobs prepared before this feature (or whose
   prepare-time conversion failed), so reprinting an old failed `.docx`
   job works. Stale converted PDFs are automatically regenerated when the
-  source office file is newer. Note that the print reflects LibreOffice's
-  rendering, which can still differ from Microsoft Word for complex layouts
-  or custom fonts not installed on the Pi.
+  source office file is newer. If the converted PDF doesn't match Word
+  (wrong page count, shifted content), see
+  [DOCX conversion inaccurate / extra pages](#docx-conversion-inaccurate--extra-pages)
+  in Troubleshooting — missing fonts are the usual cause.
 - **Other non-image, non-PDF attachments** are still sent to `lp` as-is;
   whether those print depends on your CUPS filters.
 - **Attachment size limits for previews**: Discord (~25MB on most servers)
@@ -480,6 +477,85 @@ skipped by the reply poller with a warning. To clean up for good: stop
 the bot, open `state.json`, delete the newer duplicate entries under
 `"jobs"` (the ones whose subject starts with `Re:`), and start the bot
 again.
+
+### DOCX conversion inaccurate / extra pages
+
+**Symptom:** Word shows one page count (e.g. 2 pages) but the bot's PDF
+preview or print shows more (e.g. 3 pages), with content spilling onto
+the next page at the bottom.
+
+**Cause:** LibreOffice lays out the document *before* exporting to PDF. If
+a font used in the DOCX isn't installed on the Pi, LibreOffice substitutes
+a different font with different character widths → line breaks shift →
+pagination changes. This is the most common cause of inaccurate conversion;
+PDF export settings cannot fix layout that was already calculated with the
+wrong font. Many Word fonts (e.g. **Century Gothic**) are **not** included
+in `ttf-mscorefonts-installer`.
+
+**Solutions** (try in order):
+
+1. **Install common Word font substitutes** (see the apt lines in setup
+   step 1):
+   - `fonts-crosextra-carlito` / `fonts-crosextra-caladea` → Calibri /
+     Cambria substitutes
+   - `fonts-liberation` → Arial / Times / Courier substitutes
+   - `ttf-mscorefonts-installer` → Arial, Times New Roman, Verdana, etc.
+   - Then refresh the font cache and delete any stale converted PDF:
+
+   ```bash
+   sudo fc-cache -f -v
+   rm jobs/<message_id>/YourFile.pdf
+   ```
+
+2. **Identify which font the document uses** — check the font dropdown in
+   Word, or inspect the DOCX on the Pi:
+
+   ```bash
+   unzip -p jobs/<message_id>/YourFile.docx word/fontTable.xml \
+     | grep -oP 'w:ascii="\K[^"]+' | sort -u
+   fc-match "Font Name Here"
+   ```
+
+   If `fc-match` returns a substitute (e.g. DejaVu Sans instead of
+   Century Gothic), that font is missing.
+
+3. **Copy a specific font from a Windows PC** — font files live in
+   `C:\Windows\Fonts\` (e.g. `GOTHIC.TTF` for Century Gothic). Use the
+   full path with `scp` (wildcards only work when run from the Fonts
+   directory or with an explicit path):
+
+   ```powershell
+   ssh matt@<pi-ip> "mkdir -p ~/.local/share/fonts"
+   scp C:\Windows\Fonts\GOTHIC*.TTF matt@<pi-ip>:~/.local/share/fonts/
+   ```
+
+   Then on the Pi:
+
+   ```bash
+   fc-cache -f -v
+   fc-match "Century Gothic"
+   ```
+
+4. **Copy all Windows fonts** (optional, for maximum compatibility) —
+   zip `.ttf`, `.ttc`, and `.otf` files from `C:\Windows\Fonts\`, copy
+   the archive to the Pi, unzip into `~/.local/share/fonts/windows/`, and
+   run `fc-cache -f -v`. Fine for personal use from a licensed Windows
+   install; do not redistribute the font files.
+
+5. **Workflow workarounds** when layout must match Word exactly:
+   - Email a **PDF exported from Word** instead of the `.docx`
+   - Or convert on a Windows machine with Word before sending
+
+**Re-test after installing fonts:**
+
+```bash
+rm jobs/<message_id>/YourFile.pdf
+cd ~/printbot && source venv/bin/activate
+python3 -c "
+from src.pdf_utils import office_to_pdf
+print(office_to_pdf('jobs/<message_id>/YourFile.docx', '/tmp/test'))
+"
+```
 
 ## Recommendations
 
