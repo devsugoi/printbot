@@ -99,6 +99,43 @@ class OfficeConversionConfig:
     cloudmersive: CloudmersiveConfig = field(default_factory=CloudmersiveConfig)
 
 
+_DEFAULT_PAPER_PRICES: dict[str, dict[str, float]] = {
+    "bond": {"Short": 1.50, "Long": 2.00, "A4": 1.75},
+    "photo": {"Short": 20.00, "Long": 25.00, "A4": 22.00},
+}
+
+
+@dataclass
+class CostAnalysisConfig:
+    render_dpi: int = 72
+    pixel_sample_stride: int = 4
+    white_rgb_threshold: int = 245
+    color_chroma_threshold: int = 20
+    max_pages_to_analyze: int = 20
+
+
+@dataclass
+class CostInkConfig:
+    bw_cost_per_full_page: float = 2.00
+    color_cost_per_full_page: float = 8.00
+
+
+@dataclass
+class CostEstimationConfig:
+    enabled: bool = False
+    currency_symbol: str = "₱"
+    markup_multiplier: float = 1.0
+    default_paper_type: str = "bond"
+    photo_color_coverage_threshold: float = 0.25
+    paper_prices: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {
+            k: dict(v) for k, v in _DEFAULT_PAPER_PRICES.items()
+        }
+    )
+    ink: CostInkConfig = field(default_factory=CostInkConfig)
+    analysis: CostAnalysisConfig = field(default_factory=CostAnalysisConfig)
+
+
 @dataclass
 class AppConfig:
     gmail: GmailConfig
@@ -108,6 +145,9 @@ class AppConfig:
     storage: StorageConfig
     office_conversion: OfficeConversionConfig = field(
         default_factory=OfficeConversionConfig
+    )
+    cost_estimation: CostEstimationConfig = field(
+        default_factory=CostEstimationConfig
     )
 
 
@@ -129,6 +169,19 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     office = raw.get("office_conversion", {})
     aspose = office.get("aspose", {})
     cloudmersive = office.get("cloudmersive", {})
+    cost = raw.get("cost_estimation", {})
+    ink = cost.get("ink", {})
+    analysis = cost.get("analysis", {})
+    paper_prices_raw = cost.get("paper_prices")
+    if paper_prices_raw:
+        paper_prices = {
+            str(ptype): {str(size): float(price) for size, price in sizes.items()}
+            for ptype, sizes in paper_prices_raw.items()
+        }
+    else:
+        paper_prices = {
+            k: dict(v) for k, v in _DEFAULT_PAPER_PRICES.items()
+        }
 
     return AppConfig(
         gmail=GmailConfig(
@@ -186,6 +239,31 @@ def load_config(path: str = "config.yaml") -> AppConfig:
                     if cloudmersive.get("enabled") and cloudmersive.get("api_key")
                     else ""
                 ),
+            ),
+        ),
+        cost_estimation=CostEstimationConfig(
+            enabled=bool(cost.get("enabled", False)),
+            currency_symbol=str(cost.get("currency_symbol", "₱")),
+            markup_multiplier=float(cost.get("markup_multiplier", 1.0)),
+            default_paper_type=str(cost.get("default_paper_type", "bond")),
+            photo_color_coverage_threshold=float(
+                cost.get("photo_color_coverage_threshold", 0.25)
+            ),
+            paper_prices=paper_prices,
+            ink=CostInkConfig(
+                bw_cost_per_full_page=float(
+                    ink.get("bw_cost_per_full_page", 2.00)
+                ),
+                color_cost_per_full_page=float(
+                    ink.get("color_cost_per_full_page", 8.00)
+                ),
+            ),
+            analysis=CostAnalysisConfig(
+                render_dpi=int(analysis.get("render_dpi", 72)),
+                pixel_sample_stride=int(analysis.get("pixel_sample_stride", 4)),
+                white_rgb_threshold=int(analysis.get("white_rgb_threshold", 245)),
+                color_chroma_threshold=int(analysis.get("color_chroma_threshold", 20)),
+                max_pages_to_analyze=int(analysis.get("max_pages_to_analyze", 20)),
             ),
         ),
     )

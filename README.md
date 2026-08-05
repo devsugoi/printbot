@@ -58,6 +58,8 @@ printbot/
 │   ├── gmail_client.py       # Gmail API: search, download, reply-in-thread, read replies
 │   ├── ai_classifier.py      # Gemini: is-it-a-print-request + reply-intent parsing
 │   ├── pdf_utils.py          # image→PDF, office→PDF (LibreOffice / Aspose / Cloudmersive)
+│   ├── file_analysis.py      # page count + B&W/color ink coverage analysis
+│   ├── cost_estimator.py     # PHP print cost math + Discord/email formatting
 │   ├── printer.py            # CUPS `lp` wrapper (paper size, copies)
 │   ├── confirmation.py       # shared approve/cancel/print logic + the "first wins" lock
 │   └── discord_bot.py        # Gmail + email-reply polling, Discord UI
@@ -563,6 +565,16 @@ sudo journalctl -u printbot -f     # logs
   further replies on that thread won't reopen it. If you want cancelled
   jobs to also be reprintable, add `STATUS_CANCELLED` to the retry check
   in `confirmation.ConfirmationManager.handle_approval`.
+- **Print cost estimates (PHP)**: when `cost_estimation.enabled` is true
+  in `config.yaml`, the bot analyzes each prepared file (page count, paper
+  size, approximate B&W/color ink coverage) and appends a cost breakdown
+  to both the Discord and email confirmation messages. Tune per-sheet
+  prices under `cost_estimation.paper_prices`, ink rates under
+  `cost_estimation.ink`, and optional profit via
+  `cost_estimation.markup_multiplier`. Files with high color coverage
+  automatically use photo-paper pricing; everything else defaults to bond.
+  Estimates are for **1 copy** only and are approximate — see
+  `config.example.yaml` for the full schema.
 
 ## Troubleshooting
 

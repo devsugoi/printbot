@@ -25,6 +25,8 @@ from . import gmail_client, pdf_utils
 from .ai_classifier import AllKeysExhaustedError, GeminiClassifier, ReplyDecision
 from .config import AppConfig
 from .confirmation import ConfirmationManager
+from . import cost_estimator
+from .cost_estimator import CostEstimate
 from .state import (
     STATUS_AWAITING_CONFIRMATION,
     STATUS_CONFIRMED,
@@ -286,8 +288,24 @@ class PrintBot(commands.Bot):
             return
 
         job = await self._prepare_job(email, result.paper_size)
+
+        estimate: CostEstimate | None = None
+        if self.app_config.cost_estimation.enabled:
+            try:
+                estimate = await asyncio.to_thread(
+                    cost_estimator.estimate_job,
+                    job.files,
+                    self.app_config.cost_estimation,
+                )
+            except Exception:
+                logger.exception(
+                    "Cost estimation failed for %s", email.message_id
+                )
+        if estimate is not None:
+            job.cost_estimate = estimate.to_dict()
+
         self.state.save_job(job)
-        await self._send_initial_ask(job, result.reason)
+        await self._send_initial_ask(job, result.reason, estimate=estimate)
 
     async def _prepare_job(
         self, email: gmail_client.EmailMessage, ai_paper_size: Optional[str]
@@ -389,11 +407,31 @@ class PrintBot(commands.Bot):
             files=files,
         )
 
-    async def _send_initial_ask(self, job: PrintJob, ai_reason: str):
+    async def _send_initial_ask(
+        self,
+        job: PrintJob,
+        ai_reason: str,
+        estimate: CostEstimate | None = None,
+    ):
         file_list = ", ".join(os.path.basename(f.path) for f in job.files)
         warning = self._paper_warning(job)
 
         reconvert_hint = self._reconvert_hint(job)
+        cost_discord = ""
+        cost_email = ""
+        if estimate is not None:
+            cost_discord = (
+                "\n\n"
+                + cost_estimator.format_estimate_discord(
+                    estimate, self.app_config.cost_estimation
+                )
+            )
+            cost_email = (
+                "\n\n"
+                + cost_estimator.format_estimate_email(
+                    estimate, self.app_config.cost_estimation
+                )
+            )
         discord_text = (
             f"🖨️ **Print request detected**\n"
             f"**From:** {job.sender}\n"
@@ -402,6 +440,7 @@ class PrintBot(commands.Bot):
             f"**Why:** {ai_reason}"
             + (f"\n\n{warning}" if warning else "")
             + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
+            + cost_discord
         )
         email_text = (
             f"I think this email is asking to print the attached file(s): "
@@ -412,6 +451,7 @@ class PrintBot(commands.Bot):
             f"on Discord."
             + (f"\n\n{reconvert_hint}" if reconvert_hint else "")
             + (f"\n\n{warning}" if warning else "")
+            + cost_email
         )
 
         # Only attachments the bot itself generated (e.g. images combined

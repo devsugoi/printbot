@@ -83,3 +83,35 @@ office_conversion:
   cloudmersive:
     enabled: false
     api_key: "ENV:CLOUDMERSIVE_API_KEY"
+
+# Optional print cost estimates in Philippine Pesos (PHP). Shown in the
+# Discord + email confirmation when a new print job is detected.
+cost_estimation:
+  enabled: true
+  currency_symbol: "₱"
+  markup_multiplier: 1.0          # e.g. 1.15 for 15% profit
+
+  default_paper_type: bond
+  # Files with high average color coverage switch to photo paper pricing.
+  photo_color_coverage_threshold: 0.25
+
+  paper_prices:                   # PHP per sheet
+    bond:
+      Short: 1.50                 # Letter / short bond
+      Long: 2.00
+      A4: 1.75
+    photo:
+      Short: 20.00
+      Long: 25.00
+      A4: 22.00
+
+  ink:
+    bw_cost_per_full_page: 2.00
+    color_cost_per_full_page: 8.00
+
+  analysis:
+    render_dpi: 72
+    pixel_sample_stride: 4
+    white_rgb_threshold: 245
+    color_chroma_threshold: 20
+    max_pages_to_analyze: 20

@@ -75,6 +75,7 @@ class PrintJob:
     attempts: int = 0
     fit_long_on_short: bool = False  # scale Long content onto Short paper
     approval_options: PrintOptions = field(default_factory=PrintOptions)
+    cost_estimate: Optional[dict] = None
 
     def paper_size_groups(self) -> list[tuple[str, list[PrintFile]]]:
         """Groups files by paper size, preserving first-seen order. Most
