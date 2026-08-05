@@ -71,6 +71,10 @@ printbot/
 sudo apt update
 sudo apt install -y cups cups-bsd python3-pip python3-venv git
 sudo apt install -y libreoffice   # converts .docx/.xlsx/... attachments to PDF for printing
+# Word-compatible fonts — missing fonts are the #1 cause of DOCX pagination drift
+sudo apt install -y fonts-crosextra-carlito fonts-crosextra-caladea \
+  fonts-liberation ttf-mscorefonts-installer
+sudo fc-cache -f -v
 sudo usermod -aG lpadmin $USER   # then log out/in
 ```
 
@@ -79,6 +83,17 @@ PowerPoint, OpenDocument, RTF): CUPS can't print those directly, so the
 bot converts them to PDF with `soffice --headless` first. On a
 storage-constrained Pi, `libreoffice-writer libreoffice-calc
 libreoffice-impress` covers the same formats with a smaller footprint.
+
+**DOCX pagination:** If a Word document is 2 pages but the converted PDF
+is 3 (content spilling to the next page), the Pi is almost certainly
+missing the fonts the DOCX uses. Install the font packages above
+(Carlito/Caladea are metric-compatible Calibri/Cambria substitutes;
+Liberation covers Arial/Times/Courier; `mscorefonts` adds real Arial and
+Times New Roman). After installing fonts, delete any stale converted PDF
+next to the `.docx` under `jobs/` (or reprint after removing the cached
+`.pdf`) so LibreOffice reconverts with the new fonts. The bot uses a
+dedicated LibreOffice profile (`.libreoffice-printbot/`) with inch-based
+layout and font embedding for closer Word-like output.
 
 Install the Brother DCP-J100 driver and add the printer. **The DCP-J100
 is an inkjet — do NOT use `printer-driver-brlaser`**, which only supports
@@ -395,15 +410,18 @@ sudo journalctl -u printbot -f     # logs
   `discord_bot.PrintBot._prepare_job`.
 - **Office attachments** (`.doc`, `.docx`, `.odt`, `.rtf`, `.xls`,
   `.xlsx`, `.ods`, `.ppt`, `.pptx`, `.odp`) are converted to PDF with
-  headless LibreOffice before printing, and the converted PDF is attached
-  to the confirmation message so you can check the rendering before
-  approving. This requires LibreOffice on the Pi (see setup step 1); if
-  it's missing or conversion fails, the job fails with a clear message
-  and can be reprinted after fixing the issue. Conversion also runs at
-  print time for jobs prepared before this feature (or whose prepare-time
-  conversion failed), so reprinting an old failed `.docx` job works.
-  Note that the print reflects LibreOffice's rendering, which can differ
-  slightly from Microsoft Word for complex layouts or missing fonts.
+  headless LibreOffice (dedicated profile + `writer_pdf_Export` with font
+  embedding) before printing, and the converted PDF is attached to the
+  confirmation message so you can check the rendering before approving.
+  This requires LibreOffice and Word-compatible fonts on the Pi (see setup
+  step 1); if either is missing or conversion fails, the job fails with a
+  clear message and can be reprinted after fixing the issue. Conversion
+  also runs at print time for jobs prepared before this feature (or whose
+  prepare-time conversion failed), so reprinting an old failed `.docx`
+  job works. Stale converted PDFs are automatically regenerated when the
+  source office file is newer. Note that the print reflects LibreOffice's
+  rendering, which can still differ from Microsoft Word for complex layouts
+  or custom fonts not installed on the Pi.
 - **Other non-image, non-PDF attachments** are still sent to `lp` as-is;
   whether those print depends on your CUPS filters.
 - **Attachment size limits for previews**: Discord (~25MB on most servers)

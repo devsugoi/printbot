@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
@@ -176,6 +177,45 @@ def converted_pdf_path(input_path: str) -> str:
     return base + ".pdf"
 
 
+_LIBREOFFICE_PROFILE_DIR = ".libreoffice-printbot"
+_REGISTRY_TEMPLATE = Path(__file__).resolve().parent / "libreoffice" / "registrymodifications.xcu"
+# Explicit Writer PDF export filter with font embedding (LibreOffice 7.3+).
+_WRITER_PDF_EXPORT = (
+    'pdf:writer_pdf_Export:{"EmbedStandardFonts":{"type":"boolean","value":"true"}}'
+)
+
+
+def _libreoffice_profile_root() -> Path:
+    return Path.cwd() / _LIBREOFFICE_PROFILE_DIR
+
+
+def _libreoffice_user_installation_uri() -> str:
+    return _libreoffice_profile_root().resolve().as_uri()
+
+
+def _ensure_libreoffice_profile() -> None:
+    """Seed an isolated LibreOffice user profile for reproducible headless
+    conversions (fonts/layout settings without touching a GUI profile)."""
+    user_dir = _libreoffice_profile_root() / "user"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    registry = user_dir / "registrymodifications.xcu"
+    if not registry.exists():
+        shutil.copy(_REGISTRY_TEMPLATE, registry)
+
+
+def _office_pdf_output_path(input_path: str, output_dir: str) -> str:
+    return os.path.join(output_dir, converted_pdf_path(os.path.basename(input_path)))
+
+
+def office_pdf_cache_valid(input_path: str, output_dir: str | None = None) -> bool:
+    """True if a converted PDF exists and is at least as new as the source."""
+    output_dir = output_dir or os.path.dirname(input_path) or "."
+    expected = _office_pdf_output_path(input_path, output_dir)
+    if not os.path.exists(expected) or not os.path.exists(input_path):
+        return False
+    return os.path.getmtime(expected) >= os.path.getmtime(input_path)
+
+
 def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
     """Converts an office document (.docx, .xlsx, ...) to PDF using
     headless LibreOffice, returning the path of the generated PDF.
@@ -184,6 +224,10 @@ def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
     conversion fails, with a message suitable for showing to the user.
     """
     output_dir = output_dir or os.path.dirname(input_path) or "."
+    expected = _office_pdf_output_path(input_path, output_dir)
+    if office_pdf_cache_valid(input_path, output_dir):
+        return expected
+
     binary = shutil.which("soffice") or shutil.which("libreoffice")
     if binary is None:
         raise OfficeConversionError(
@@ -192,9 +236,11 @@ def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
             f"with: sudo apt install -y libreoffice"
         )
 
+    _ensure_libreoffice_profile()
     command = [
         binary, "--headless",
-        "--convert-to", "pdf",
+        f"-env:UserInstallation={_libreoffice_user_installation_uri()}",
+        "--convert-to", _WRITER_PDF_EXPORT,
         "--outdir", output_dir,
         input_path,
     ]
@@ -206,10 +252,6 @@ def office_to_pdf(input_path: str, output_dir: str | None = None) -> str:
         raise OfficeConversionError(
             f"Converting {os.path.basename(input_path)} to PDF timed out."
         )
-
-    expected = os.path.join(
-        output_dir, converted_pdf_path(os.path.basename(input_path))
-    )
     if result.returncode != 0 or not os.path.exists(expected):
         detail = (result.stderr or result.stdout or "").strip()
         raise OfficeConversionError(
